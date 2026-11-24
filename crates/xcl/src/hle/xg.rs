@@ -694,39 +694,57 @@ unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, su
     S_OK
 }
 
-/// the level's place in `src` (the whole resource) → rows of `dst` (`row_pitch` apart)
-unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
-    let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
+/// the level's place in the resource at `base + offset` → rows of `dst` (`row_pitch` apart).
+/// The resource comes as a base address and a byte offset from it: a retail game's calls, read
+/// as (base, row pitch, slice pitch), had the same base 0x7_0000_0000 for different textures, a
+/// "row pitch" of hundreds of MB and a "slice pitch" exactly one row of the level – and the
+/// first such copy ended the process in memcpy, its second row far outside the buffer.
+unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, base: *const u8, offset: u64, row_pitch: u32, slice_pitch: u32) -> HRESULT {
+    let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !base.is_null()) else { return E_INVALIDARG };
+    let src = base.wrapping_add(offset as usize);
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
-    // the bytes of `dst` the rows go to: a destination that is not committed memory is refused
-    // (a retail game's copy wrote into a page that was not, and the process ended in memcpy)
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    let seen = SEEN.fetch_add(1, Ordering::Relaxed);
+    if seen < 4 {
+        crate::xlog_info!(
+            "XGTextureAddressComputer::CopyFromSubresource #{seen}: destination {:#x}, plane {plane}, subresource {sub}, resource {:#x} + {offset:#x}, row pitch {row_pitch}, slice pitch {slice_pitch} (level {i} {}x{}x{}, {row} bytes a row)",
+            dst as usize,
+            base as usize,
+            m.width,
+            m.height,
+            m.depth
+        );
+    }
+    // the bytes of `dst` the rows go to and of the resource they come from: memory that is not
+    // committed is refused rather than copied into or out of
     let span = if t.depth > 0 { (m.depth - 1) * slice_pitch as usize } else { 0 } + (m.height - 1) * row_pitch as usize + row;
-    if !crate::gpu::shader::readable(dst as usize, span) {
+    let from = if t.depth > 0 { (src as usize + at as usize, t.size() as usize) } else { (src as usize + at as usize + k * t.chain.slice_bytes, t.chain.slice_bytes) };
+    if row_pitch as usize > 0 && (row_pitch as usize) < row || !crate::gpu::shader::readable(dst as usize, span) || !crate::gpu::shader::readable(from.0, from.1) {
         static N: AtomicU32 = AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 8 {
             crate::xlog_warn!(
-                "XGTextureAddressComputer::CopyFromSubresource: destination {:#x}..{:#x} is not committed memory – refused (plane {plane}, subresource {sub}, level {i} {}x{}x{}, {} bytes a row, row pitch {row_pitch}, slice pitch {slice_pitch}, source {:#x})",
+                "XGTextureAddressComputer::CopyFromSubresource: refused – destination {:#x}..{:#x}, source {:#x}..{:#x} (plane {plane}, subresource {sub}, level {i} {}x{}x{}, {row} bytes a row, row pitch {row_pitch}, slice pitch {slice_pitch})",
                 dst as usize,
                 dst as usize + span,
+                from.0,
+                from.0 + from.1,
                 m.width,
                 m.height,
-                m.depth,
-                row,
-                src as usize
+                m.depth
             );
         }
         return E_INVALIDARG;
     }
     if t.depth > 0 {
-        let linear = t.chain.detile_volume(std::slice::from_raw_parts(src.add(at as usize), t.size() as usize), i);
+        let linear = t.chain.detile_volume(std::slice::from_raw_parts(from.0 as *const u8, from.1), i);
         for (n, from) in linear.chunks_exact(row).enumerate() {
             let to = n / m.height * slice_pitch as usize + n % m.height * row_pitch as usize;
             std::ptr::copy_nonoverlapping(from.as_ptr(), dst.add(to), row);
         }
         return S_OK;
     }
-    let slice = std::slice::from_raw_parts(src.add(at as usize + k * t.chain.slice_bytes), t.chain.slice_bytes);
+    let slice = std::slice::from_raw_parts(from.0 as *const u8, from.1);
     let linear = t.chain.detile_level(slice, i, k);
     for y in 0..m.height {
         std::ptr::copy_nonoverlapping(linear[y * row..].as_ptr(), dst.add(y * row_pitch as usize), row);
