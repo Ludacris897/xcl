@@ -17,7 +17,7 @@
 //! go to that window's buffer (`real::uma_window_buffer`), which is in COMMON between them.
 //! An index buffer at such an address is given to the PC as the window buffer's GPU address.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -871,7 +871,56 @@ fn pick_queue(last_queue: Option<usize>, device: usize, ty: D3D12_COMMAND_LIST_T
     g.iter().rev().find(|info| info.ty == ty && (device == 0 || info.device == 0 || info.device == device)).map(|info| info.queue)
 }
 
+// Opt-in bounded history: report recent overlapping recorded producers only on a
+// timeout. A recorded write is NOT evidence that its command list has executed.
+#[derive(Clone, Copy, Debug)]
+struct SyncWrite {
+    list: usize,
+    va: u64,
+    bytes: u64,
+    kind: &'static str,
+    value: Option<u64>,
+}
+
+impl SyncWrite {
+    fn overlaps(&self, va: u64, bytes: u64) -> bool {
+        self.bytes != 0 && bytes != 0
+            && self.va < va.saturating_add(bytes)
+            && va < self.va.saturating_add(self.bytes)
+    }
+}
+
+const SYNC_TRACE_LIMIT: usize = 16384;
+static SYNC_TRACE: Mutex<VecDeque<SyncWrite>> = Mutex::new(VecDeque::new());
+
+fn sync_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TRACE_SYNC").is_ok_and(|v| v == "1"))
+}
+
+fn trace_write(list: usize, va: u64, bytes: u64, kind: &'static str, value: Option<u64>) {
+    if !sync_trace_enabled() { return; }
+    let mut history = SYNC_TRACE.lock().unwrap();
+    if history.len() == SYNC_TRACE_LIMIT { history.pop_front(); }
+    history.push_back(SyncWrite { list, va, bytes, kind, value });
+}
+
+fn trace_wait_timeout(wait: &PendingWait) {
+    if !sync_trace_enabled() { return; }
+    let (count, matches) = {
+        let history = SYNC_TRACE.lock().unwrap();
+        (history.len(), history.iter().rev()
+            .filter(|w| w.overlaps(wait.va, u64::from(wait.width)))
+            .take(8).copied().collect::<Vec<_>>())
+    };
+    crate::xlog_info!("XCL SYNC: timeout at {:#x}, wanted {:#x}; {} recent overlapping producer record(s), {} records retained (recording only, not GPU completion)", wait.va, wait.value, matches.len(), count);
+    for w in matches {
+        crate::xlog_info!("XCL SYNC: producer list {:#x}, address {:#x}, {} bytes, {}, value {:x?}", w.list, w.va, w.bytes, w.kind, w.value);
+    }
+}
+
 fn note_write(list: usize, va: u64, size: u64) {
+    trace_write(list, va, size, "GPU write range", None);
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
 }
 
@@ -889,6 +938,7 @@ unsafe fn wait_all(waits: &[PendingWait]) {
                 w.mask,
                 w.read_value()
             );
+            trace_wait_timeout(w);
         }
     }
 }
@@ -1091,6 +1141,11 @@ pub(super) unsafe extern "system" fn fill128_x(this: *mut c_void, va: u64, size:
 unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFFERIMMEDIATE_MODE, what: &str) {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = 4 * words.len() as u64;
+    let value = match words {
+        [lo] => Some(u64::from(*lo)),
+        [lo, hi] => Some(u64::from(*lo) | (u64::from(*hi) << 32)),
+        _ => None,
+    };
     if !va.is_multiple_of(n) {
         return warn(&N, what, format_args!("{va:#x} is not {n}-byte aligned"));
     }
@@ -1099,12 +1154,15 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         if super::cpu_writes::writable(va as usize, n as usize) {
             if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
                 s.cpu_writes.push(super::cpu_writes::Write::Immediate(va as usize, words.to_vec()));
+                trace_write(list as usize, va, n, "CPU deferred immediate", value);
                 return;
             }
         }
+        trace_write(list as usize, va, n, "rejected immediate", value);
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     };
     note_write(list as usize, va, n);
+    trace_write(list as usize, va, n, "GPU immediate", value);
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
     let modes = vec![mode; words.len()];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
@@ -1198,6 +1256,7 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
     type Resolve = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
     if let Some((d, off)) = uma_dst {
         note_write(list as usize, va, 8);
+        trace_write(list as usize, va, 8, "GPU timestamp", None);
         pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
         as_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
     } else if let Some((rb, base)) = readback {
@@ -1210,6 +1269,7 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
         let off = i as u64 * 8;
         s.cpu_writes.push(super::cpu_writes::Write::ReadbackU64 { va: va as usize, src: base + off as usize, _buf: rb });
         drop(g);
+        trace_write(list as usize, va, 8, "CPU deferred timestamp", None);
         pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
         pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, rb_raw, off);
     }
@@ -2681,6 +2741,17 @@ mod tests {
     fn fill_patterns_repeat_the_value() {
         assert_eq!(pattern(&0x1122_3344u32.to_le_bytes())[..8], [0x44, 0x33, 0x22, 0x11, 0x44, 0x33, 0x22, 0x11]);
         assert_eq!(pattern(&[7u8; 16]), [7u8; 16]);
+    }
+
+    #[test]
+    fn sync_trace_overlap_covers_partial_and_adjacent_ranges() {
+        let w = SyncWrite { list: 1, va: 0x1000, bytes: 8, kind: "test", value: Some(7) };
+        assert!(w.overlaps(0x1000, 8));
+        assert!(w.overlaps(0x1004, 4));
+        assert!(w.overlaps(0xffc, 8));
+        assert!(!w.overlaps(0x1008, 4));
+        assert!(!w.overlaps(0xff8, 8));
+        assert!(!w.overlaps(0x1000, 0));
     }
 
     #[test]
