@@ -119,6 +119,19 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::vfs::init(crate::vfs::Vfs::new(&boot.game_root, &boot.data_dir, mounts).own_folder(&crate::gpu::recomp::dxc::cache_dir()));
     let _ = std::fs::create_dir_all(boot.data_dir.join("temp"));
 
+    // Resolve the Agility SDK before the file hooks go in: the lookup (`D3D12Core.dll` next to xcl.exe or in
+    // XCL_D3D12_DIR) uses std::fs, which the VFS hooks would route to the game's folders, so a lazy first use from
+    // the game's thread reported "has no D3D12Core.dll" for a file that exists. Initializing it here also applies the
+    // factory to the global state before the title's first D3D12SerializeVersionedRootSignature call.
+    match crate::gpu::agility::state() {
+        crate::gpu::agility::State::Loaded { version, dir, .. } => {
+            crate::xlog_info!("D3D12: Agility SDK v{version} ({}) resolved before the VFS hooks", dir.display());
+        }
+        crate::gpu::agility::State::Unavailable(reason) => {
+            crate::xlog_warn!("D3D12: Agility SDK unavailable ({reason}) – using inbox D3D12");
+        }
+        crate::gpu::agility::State::NotFound => {}
+    }
     if let Err(e) = crate::vfs_hooks::install() {
         crate::xlog_error!("VFS: not all hooks installed: {e}");
     }
