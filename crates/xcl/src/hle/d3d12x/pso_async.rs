@@ -25,6 +25,8 @@ struct Pending {
     orphan: AtomicBool,
     /// Counted in IN_FLIGHT while this stand-in is live and unfinished.
     tracked: AtomicBool,
+    /// Estimated bytes of shader/program data held by the deferred job.
+    captured_bytes: usize,
 }
 
 /// stand-in handed to the title → its real pipeline
@@ -32,10 +34,19 @@ static PENDING: RwLock<Option<HashMap<usize, Arc<Pending>>>> = RwLock::new(None)
 /// Number of still-live stand-ins whose jobs have not completed. Unlike scanning
 /// every job and locking its Condvar state, this is O(1) on activity/report paths.
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static CAPTURED_BYTES: AtomicUsize = AtomicUsize::new(0);
+static CAPTURED_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// Approximate bytes of deferred job payloads currently mapped and maximum so far.
+/// This estimates owned shader descriptions, not D3D12 driver allocations.
+pub fn captured_memory() -> (usize, usize) {
+    (CAPTURED_BYTES.load(Ordering::Relaxed), CAPTURED_PEAK.load(Ordering::Relaxed))
+}
 
 fn stop_tracking(p: &Pending) {
     if p.tracked.swap(false, Ordering::AcqRel) {
         IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+        CAPTURED_BYTES.fetch_sub(p.captured_bytes, Ordering::Relaxed);
     }
 }
 
@@ -104,7 +115,12 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true);
+    submit_as(standin, compute, job, true, 0);
+}
+
+/// Like submit(), but accounts for the job's owned shader/descriptor payload.
+pub fn submit_with_size(standin: usize, compute: bool, job: Job, bytes: usize) {
+    submit_as(standin, compute, job, true, bytes);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -119,10 +135,15 @@ pub fn lazy() -> bool {
 
 /// `submit`, sent to the workers only on its first `resolve` (`lazy`).
 pub fn submit_lazy(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, false);
+    submit_as(standin, compute, job, false, 0);
 }
 
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
+/// Like submit_lazy(), but accounts for the job's owned shader/descriptor payload.
+pub fn submit_lazy_with_size(standin: usize, compute: bool, job: Job, bytes: usize) {
+    submit_as(standin, compute, job, false, bytes);
+}
+
+fn submit_as(standin: usize, compute: bool, job: Job, send: bool, bytes: usize) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: AtomicBool::new(send),
@@ -132,6 +153,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
         compute,
         orphan: Default::default(),
         tracked: AtomicBool::new(true),
+        captured_bytes: bytes,
     });
     {
         let mut state = PENDING.write().unwrap();
@@ -142,7 +164,16 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
             replaced.orphan.store(true, Ordering::Release);
             stop_tracking(&replaced);
         }
-        IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        let pending = IN_FLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
+        let total_bytes = CAPTURED_BYTES.fetch_add(bytes, Ordering::Relaxed).saturating_add(bytes);
+        CAPTURED_PEAK.fetch_max(total_bytes, Ordering::Relaxed);
+        if pending >= 4096 && pending.is_power_of_two() {
+            crate::xlog_info!(
+                "D3D12.X: {pending} lazy/background PSOs tracked; estimated owned job payload {} MiB, peak {} MiB (excludes driver allocations)",
+                total_bytes >> 20,
+                CAPTURED_PEAK.load(Ordering::Relaxed) >> 20,
+            );
+        }
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -240,6 +271,23 @@ pub fn counts() -> (usize, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_job_payload_is_released_on_completion_and_abandonment() {
+        let first = usize::MAX - 0x3300;
+        let second = usize::MAX - 0x4400;
+        let baseline = captured_memory().0;
+        submit_lazy_with_size(first, true, Box::new(|| 0), 8192);
+        assert_eq!(captured_memory().0, baseline + 8192);
+        assert_eq!(resolve_for_bind(first), first);
+        assert_eq!(captured_memory().0, baseline);
+        assert_eq!(released(first), 0);
+
+        submit_lazy_with_size(second, false, Box::new(|| 0), 4096);
+        assert_eq!(captured_memory().0, baseline + 4096);
+        assert_eq!(released(second), 0);
+        assert_eq!(captured_memory().0, baseline);
+    }
 
     #[test]
     fn lazy_compute_job_resolves_and_retires_without_worker() {

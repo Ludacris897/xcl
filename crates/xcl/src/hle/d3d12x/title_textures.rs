@@ -330,6 +330,12 @@ static PERF_REFRESH_US: AtomicU64 = AtomicU64::new(0);
 static PERF_WATCH_US: AtomicU64 = AtomicU64::new(0);
 static PERF_SELECT_US: AtomicU64 = AtomicU64::new(0);
 static PERF_DETILE_US: AtomicU64 = AtomicU64::new(0);
+static PERF_SOURCE_READ_US: AtomicU64 = AtomicU64::new(0);
+static PERF_TILING_ONLY_US: AtomicU64 = AtomicU64::new(0);
+static PERF_SOURCE_BYTES: AtomicU64 = AtomicU64::new(0);
+static PERF_BULK_READ_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static PERF_BULK_READ_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static PERF_BULK_READ_BYTES: AtomicU64 = AtomicU64::new(0);
 static PERF_GPU_BATCH_US: AtomicU64 = AtomicU64::new(0);
 static PERF_BATCHES: AtomicU64 = AtomicU64::new(0);
 static PERF_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -382,6 +388,20 @@ fn perf_report() {
         PERF_BATCHES.load(Ordering::Relaxed),
         PERF_BYTES.load(Ordering::Relaxed) >> 20
     );
+    crate::xlog_info!(
+        "XCL PERF subresource details: source snapshot {} ms ({} MiB requested), CPU swizzle/detile {} ms; parent CPU-detile counter includes both and allocation overhead",
+        us(&PERF_SOURCE_READ_US),
+        PERF_SOURCE_BYTES.load(Ordering::Relaxed) >> 20,
+        us(&PERF_TILING_ONLY_US)
+    );
+    if bulk_title_reads_enabled() {
+        crate::xlog_info!(
+            "XCL PERF guarded bulk texture reads: {} successes / {} attempts, {} MiB read without a VirtualQuery region walk",
+            PERF_BULK_READ_SUCCESSES.load(Ordering::Relaxed),
+            PERF_BULK_READ_ATTEMPTS.load(Ordering::Relaxed),
+            PERF_BULK_READ_BYTES.load(Ordering::Relaxed) >> 20,
+        );
+    }
     let watch_calls = PERF_WATCH_CALLS.load(Ordering::Relaxed);
     if watch_calls > 0 {
         crate::xlog_info!(
@@ -392,6 +412,14 @@ fn perf_report() {
             PERF_WATCH_ERRORS.load(Ordering::Relaxed),
             watch_gap_bytes() >> 10,
         );
+    }
+    let (retained, peak) = super::pso_async::captured_memory();
+    crate::xlog_info!("XCL PERF deferred pipeline payload: {} MiB retained, {} MiB peak (owned descriptions only, not driver/other heap)", retained >> 20, peak >> 20);
+    let (reused, created) = texture::wait_cache_counts();
+    crate::xlog_info!("XCL PERF texture fence waits: {reused} reused, {created} newly allocated (bounded per-thread cache)");
+    let (batches, textures, mib, fallbacks) = texture::coalescing_stats();
+    if batches > 0 || fallbacks > 0 {
+        crate::xlog_info!("XCL PERF coalesced upload: {batches} batches, {textures} textures, {mib} MiB staging, {fallbacks} oversized/allocation fallbacks");
     }
 }
 
@@ -1122,6 +1150,31 @@ fn watch_ranges_with_gap(regions: &[(usize, usize)], mut wanted: Vec<(usize, usi
     out
 }
 
+/// Try copying a complete contiguous title range using a guarded OS read. This is
+/// faster than walking VirtualQuery regions when *all* pages are committed and readable,
+/// but may add one failed syscall on sparse allocations. For that reason it is opt-in.
+fn bulk_title_reads_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_TITLE_BULK_READ").is_ok_and(|v| v == "1"))
+}
+
+/// The operation fails rather than dereferencing an unmapped or decommitted guest page.
+unsafe fn try_bulk_title_snapshot(at: usize, out: &mut [u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if out.is_empty() {
+        return true;
+    }
+    let mut done = 0usize;
+    ReadProcessMemory(
+        GetCurrentProcess(),
+        at as *const c_void,
+        out.as_mut_ptr() as *mut c_void,
+        out.len(),
+        &mut done,
+    ) != 0 && done == out.len()
+}
+
 /// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
 /// has only some of its pages mapped).
 unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
@@ -1132,6 +1185,23 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
         return out;
+    }
+    // One guarded whole-range copy can avoid thousands of VirtualQuery + read
+    // calls when the range is truly contiguous and resident. A partial/failed
+    // attempt must *not* leak bytes from an unreadable region: reset the output
+    // before the existing region-by-region path.
+    if bulk_title_reads_enabled() {
+        if perf_enabled() {
+            PERF_BULK_READ_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        }
+        if try_bulk_title_snapshot(at, &mut out) {
+            if perf_enabled() {
+                PERF_BULK_READ_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+                PERF_BULK_READ_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+            }
+            return out;
+        }
+        out.fill(0);
     }
     let mut p = at;
     while p < at + len {
@@ -1180,24 +1250,57 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     let Some(tex) = tex.texels() else { return Vec::new() };
     let c = &tex.chain;
     let bpe = tex.bpe as usize;
+    let profile = perf_enabled();
     if tex.depth > 0 {
+        let t0 = profile.then(std::time::Instant::now);
         let mem = read_committed(va, tex.size() as usize);
-        return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(&mem, i) }).collect();
+        if let Some(t) = t0 {
+            perf_note(&PERF_SOURCE_READ_US, t.elapsed());
+            PERF_SOURCE_BYTES.fetch_add(mem.len() as u64, Ordering::Relaxed);
+        }
+        return c.levels.iter().enumerate().map(|(i, l)| {
+            let detile_t0 = profile.then(std::time::Instant::now);
+            let data = c.detile_volume(&mem, i);
+            if let Some(t) = detile_t0 {
+                perf_note(&PERF_TILING_ONLY_US, t.elapsed());
+            }
+            Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data }
+        }).collect();
     }
     let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
-    for s in 0..tex.array as usize {
-        let slice = read_committed(va + s * c.slice_bytes, c.slice_bytes);
+    for slice_index in 0..tex.array as usize {
+        let t0 = profile.then(std::time::Instant::now);
+        let slice = read_committed(va + slice_index * c.slice_bytes, c.slice_bytes);
+        if let Some(t) = t0 {
+            perf_note(&PERF_SOURCE_READ_US, t.elapsed());
+            PERF_SOURCE_BYTES.fetch_add(slice.len() as u64, Ordering::Relaxed);
+        }
         for (i, l) in c.levels.iter().enumerate() {
-            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(&slice, i, s) });
+            let detile_t0 = profile.then(std::time::Instant::now);
+            let data = c.detile_level(&slice, i, slice_index);
+            if let Some(t) = detile_t0 {
+                perf_note(&PERF_TILING_ONLY_US, t.elapsed());
+            }
+            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data });
         }
     }
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_texture_snapshot_reads_valid_contiguous_ranges_and_rejects_bad_pages() {
+        let original: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let mut out = vec![0u8; original.len()];
+        unsafe {
+            assert!(try_bulk_title_snapshot(original.as_ptr() as usize, &mut out));
+            assert_eq!(original, out);
+            assert!(!try_bulk_title_snapshot(0x10, &mut out));
+        }
+    }
 
     #[test]
     fn configurable_upload_batch_preserves_default_and_bounds() {

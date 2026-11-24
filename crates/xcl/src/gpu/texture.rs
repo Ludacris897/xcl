@@ -13,7 +13,12 @@
 use super::desc::{self, Image, ImageType};
 use super::fence;
 use super::tiling::{self, Chain, PipeConfig};
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
+use windows::core::Interface;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::System::Threading::CreateEventW;
 
 /// Pipes / packers of the console's GB_ADDR_CONFIG – only the XOR (_X) modes depend on it.
 /// From the console's own layout library: every texel of every mode matches with 32 pipes /
@@ -205,6 +210,14 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
 /// the texture is in and is left in: one for every subresource, or one per subresource (D3D12
 /// order). A failure of one is returned with its index; the others still run.
 pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
+    if coalesced_uploads_enabled() {
+        return upload_batch_coalesced(dev, queue, items);
+    }
+    upload_batch_legacy(dev, queue, items)
+}
+
+/// Original per-texture upload-buffer path (also the fallback for oversized batches).
+unsafe fn upload_batch_legacy(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
     if items.is_empty() {
         return Ok(Vec::new());
     }
@@ -222,6 +235,172 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
     wait(dev, queue)?;
     drop(staging);
+    Ok(failed)
+}
+
+/// Coalesce small uploads behind an explicit runtime flag. Disabled by default until
+/// matched A/B runs establish a benefit and visual correctness.
+fn coalesced_uploads_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_COALESCE_UPLOADS").is_ok_and(|v| v == "1"))
+}
+
+static COALESCED_BATCHES: AtomicU64 = AtomicU64::new(0);
+static COALESCED_TEXTURES: AtomicU64 = AtomicU64::new(0);
+static COALESCED_STAGE_BYTES: AtomicU64 = AtomicU64::new(0);
+static COALESCED_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// (coalesced GPU batches, staged textures, staging MiB, fallback batches)
+pub fn coalescing_stats() -> (u64, u64, u64, u64) {
+    (
+        COALESCED_BATCHES.load(Ordering::Relaxed),
+        COALESCED_TEXTURES.load(Ordering::Relaxed),
+        COALESCED_STAGE_BYTES.load(Ordering::Relaxed) >> 20,
+        COALESCED_FALLBACKS.load(Ordering::Relaxed),
+    )
+}
+
+/// D3D12 requires placed texture footprints to begin at 512-byte boundaries.
+fn placed_range(offset: u64, size: u64) -> Option<(u64, u64)> {
+    let start = offset.checked_add(511)? & !511;
+    let end = start.checked_add(size)?;
+    Some((start, end))
+}
+
+struct BatchLayout {
+    item: usize,
+    footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    rows: Vec<u32>,
+}
+
+/// Build one D3D12 upload-heap buffer for a complete batch, and wait *once* as
+/// before. The staged byte ranges and the GPU copy/barrier ordering are exactly
+/// the same as the per-resource path. A too-large batch or allocation failure
+/// falls back to the old implementation.
+unsafe fn upload_batch_coalesced(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)],
+) -> Result<Vec<(usize, String)>, String> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fallback = || {
+        COALESCED_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        unsafe { upload_batch_legacy(dev, queue, items) }
+    };
+    // Cap staging independently of the texture pool's console-byte budget:
+    // D3D12 row pitch padding can substantially enlarge the actual upload.
+    const MAX_STAGE_BYTES: u64 = 512 << 20;
+    let mut total = 0u64;
+    let mut layouts = Vec::with_capacity(items.len());
+    let mut failed = Vec::new();
+    for (item, (resource, subs, states)) in items.iter().enumerate() {
+        let prepared = (|| -> Result<(Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>, Vec<u32>, u64), String> {
+            validate_subresources(subs)?;
+            let n = subs.len();
+            let rd = resource.GetDesc();
+            validate_subresource_count(&rd, n)?;
+            if states.len() != 1 && states.len() != n {
+                return Err(format!("{} subresource states for {n} subresources", states.len()));
+            }
+            let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
+            let mut rows = vec![0u32; n];
+            let mut row_bytes = vec![0u64; n];
+            let mut bytes = 0u64;
+            dev.GetCopyableFootprints(&rd, 0, n as u32, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_bytes.as_mut_ptr()), Some(&mut bytes));
+            for (i, ((sub, fp), (&nrows, &nbytes))) in subs.iter().zip(&fps).zip(rows.iter().zip(&row_bytes)).enumerate() {
+                if sub.rows != nrows as usize || sub.depth != fp.Footprint.Depth as usize || sub.row_bytes != nbytes as usize {
+                    return Err(format!(
+                        "texture subresource {i} is {}x{}x{} B, resource expects {}x{}x{} B",
+                        sub.row_bytes, sub.rows, sub.depth, nbytes, nrows, fp.Footprint.Depth
+                    ));
+                }
+            }
+            Ok((fps, rows, bytes))
+        })();
+        let (mut fps, rows, bytes) = match prepared {
+            Ok(v) => v,
+            Err(e) => { failed.push((item, e)); continue },
+        };
+        let Some((base, end)) = placed_range(total, bytes) else {
+            return fallback();
+        };
+        if end > MAX_STAGE_BYTES {
+            return fallback();
+        }
+        for fp in &mut fps {
+            let Some(at) = fp.Offset.checked_add(base) else {
+                return fallback();
+            };
+            fp.Offset = at;
+        }
+        total = end;
+        layouts.push(BatchLayout { item, footprints: fps, rows });
+    }
+    if layouts.is_empty() {
+        return Ok(failed);
+    }
+    let up = match buffer(dev, total) {
+        Ok(up) => up,
+        Err(_) => return upload_batch_legacy(dev, queue, items),
+    };
+    let mut p = std::ptr::null_mut();
+    up.Map(0, None, Some(&mut p)).map_err(err)?;
+    for layout in &layouts {
+        let subs = &items[layout.item].1;
+        for ((sub, fp), &nrows) in subs.iter().zip(&layout.footprints).zip(&layout.rows) {
+            let pitch = fp.Footprint.RowPitch as usize;
+            let row = sub.row_bytes.min(pitch);
+            let slice_pitch = pitch * nrows as usize;
+            for z in 0..(fp.Footprint.Depth as usize).min(sub.depth) {
+                for y in 0..(nrows as usize).min(sub.rows) {
+                    let at = fp.Offset as usize + z * slice_pitch + y * pitch;
+                    std::ptr::copy_nonoverlapping(
+                        sub.data[(z * sub.rows + y) * sub.row_bytes..].as_ptr(),
+                        (p as *mut u8).add(at),
+                        row,
+                    );
+                }
+            }
+        }
+    }
+    up.Unmap(0, None);
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
+    for layout in &layouts {
+        let (resource, subs, states) = &items[layout.item];
+        let n = subs.len();
+        let to_copy = transitions(resource, states, &[D3D12_RESOURCE_STATE_COPY_DEST], n);
+        if !to_copy.is_empty() {
+            list.ResourceBarrier(&to_copy);
+        }
+        for (subresource, fp) in layout.footprints.iter().enumerate() {
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(resource),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: subresource as u32 },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&up),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp },
+            };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        let back = transitions(resource, &[D3D12_RESOURCE_STATE_COPY_DEST], states, n);
+        if !back.is_empty() {
+            list.ResourceBarrier(&back);
+        }
+    }
+    list.Close().map_err(err)?;
+    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
+    let result = wait(dev, queue);
+    drop(up);
+    result?;
+    COALESCED_BATCHES.fetch_add(1, Ordering::Relaxed);
+    COALESCED_TEXTURES.fetch_add(layouts.len() as u64, Ordering::Relaxed);
+    COALESCED_STAGE_BYTES.fetch_add(total, Ordering::Relaxed);
     Ok(failed)
 }
 
@@ -311,13 +490,84 @@ fn transitions(r: &ID3D12Resource, from: &[D3D12_RESOURCE_STATES], to: &[D3D12_R
     (0..n).filter(|&k| at(from, k) != at(to, k)).map(|k| transition_sub(r, k as u32, at(from, k), at(to, k))).collect()
 }
 
+/// A texture upload currently waits for GPU completion before dropping its staging
+/// allocations. Reuse the fence instead of paying for CreateFence at *every* batch.
+/// Keep queue/device COM refs alongside raw identities to prevent address reuse.
+struct UploadWait {
+    device: ID3D12Device,
+    queue: ID3D12CommandQueue,
+    fence: ID3D12Fence,
+    value: u64,
+    event: HANDLE,
+}
+
+impl Drop for UploadWait {
+    fn drop(&mut self) {
+        unsafe { let _ = CloseHandle(self.event); }
+    }
+}
+
+/// Bounded per-thread cache: XCL's texture refresh is serialized, but diagnostic
+/// readbacks and other upload callers may use different queues or threads.
+/// Per-thread ownership avoids a global mutex across a GPU wait.
+thread_local! {
+    static WAIT_CACHE: RefCell<Vec<UploadWait>> = const { RefCell::new(Vec::new()) };
+}
+static WAIT_REUSED: AtomicU64 = AtomicU64::new(0);
+static WAIT_CREATED: AtomicU64 = AtomicU64::new(0);
+
+/// (reused upload fences, new upload fences) across all threads.
+pub fn wait_cache_counts() -> (u64, u64) {
+    (WAIT_REUSED.load(Ordering::Relaxed), WAIT_CREATED.load(Ordering::Relaxed))
+}
+
 /// Wait until `queue` has run everything submitted so far.
+///
+/// The previous implementation allocated an ID3D12Fence on every call; a world
+/// load can issue thousands of small upload batches and incur repeated driver
+/// object creation. The new implementation retains at most four fences per
+/// thread, each with monotonically increasing targets; it *does not* remove
+/// GPU waits or change staging-resource lifetimes.
 pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(), String> {
     let copy_error = |e| format!("texture copy: {e}");
-    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
-        .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
-    queue.Signal(&fence, 1).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
-    fence::wait(&fence, 1, dev, None, 10_000).map_err(copy_error)
+    let (fence, value, event) = WAIT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(entry) = cache.iter_mut().find(|e|
+            e.queue.as_raw() == queue.as_raw() && e.device.as_raw() == dev.as_raw()
+        ) {
+            // On theoretical u64 rollover, start a new fence so a completed
+            // signal cannot satisfy a future wait accidentally.
+            if let Some(next) = entry.value.checked_add(1) {
+                entry.value = next;
+                WAIT_REUSED.fetch_add(1, Ordering::Relaxed);
+                return Ok((entry.fence.clone(), next, entry.event));
+            }
+            let fresh: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
+            entry.fence = fresh.clone();
+            entry.value = 1;
+            WAIT_CREATED.fetch_add(1, Ordering::Relaxed);
+            return Ok((fresh, 1, entry.event));
+        }
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
+            .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
+        let event = CreateEventW(None, false, false, None)
+            .map_err(|e| copy_error(fence::api_error(dev, "CreateEventW", e)))?;
+        if cache.len() == 4 {
+            cache.remove(0);
+        }
+        cache.push(UploadWait {
+            device: dev.clone(),
+            queue: queue.clone(),
+            fence: fence.clone(),
+            value: 1,
+            event,
+        });
+        WAIT_CREATED.fetch_add(1, Ordering::Relaxed);
+        Ok((fence, 1, event))
+    })?;
+    queue.Signal(&fence, value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+    fence::wait(&fence, value, dev, Some(event), 10_000).map_err(copy_error)
 }
 
 unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String> {
@@ -358,6 +608,18 @@ fn transition_sub(r: &ID3D12Resource, sub: u32, before: D3D12_RESOURCE_STATES, a
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn coalesced_footprint_offsets_are_aligned_and_overflow_safe() {
+        assert_eq!(placed_range(0, 256), Some((0, 256)));
+        assert_eq!(placed_range(256, 128), Some((512, 640)));
+        assert_eq!(placed_range(512, 256), Some((512, 768)));
+        assert_eq!(placed_range(u64::MAX, 1), None);
+        assert_eq!(placed_range(u64::MAX - 511, 1024), None);
+        let (a, end_a) = placed_range(0, 16384).unwrap();
+        let (b, end_b) = placed_range(end_a, 4096).unwrap();
+        assert_eq!((a, b, end_b), (0, 16384, 20480));
+    }
+
     use super::*;
     use std::collections::HashMap;
     use windows::Win32::Graphics::Dxgi::Common::*;

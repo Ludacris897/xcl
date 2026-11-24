@@ -4,12 +4,14 @@ on:
   push:
     branches:
       - experiment/xg-copy-validation-20261123
+      - experiment/streaming-hotpath-20261123
   pull_request:
     paths:
       - 'crates/xcl/src/hle/xg.rs'
       - 'crates/xcl/src/hle/d3d12x/pso_async.rs'
       - 'crates/xcl/src/hle/d3d12x/title_textures.rs'
       - 'crates/xcl/src/gpu/tiling.rs'
+      - 'crates/xcl/src/gpu/texture.rs'
       - 'tools/analyze-xcl-perf.py'
       - 'tools/test-analyze-xcl-perf.py'
       - '.github/workflows/xg-copy-validation.yml'
