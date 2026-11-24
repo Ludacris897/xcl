@@ -13,7 +13,13 @@ path = "src/lib.rs"
 name = "xcl"
 path = "src/main.rs"
 
+[features]
+default = []
+# Opt-in experimental BC1 decompression; XCL_BCPACK_BC1=1 enables it at runtime.
+bcpack-bc1 = ["dep:bcpack-rs"]
+
 [dependencies]
+bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "c51ec521cbe6869136f29f5d157342374ef5cf33", default-features = false, optional = true }
 miniz_oxide = "0.9"
 retour = "0.3"
 serde = { version = "1", features = ["derive"] }
