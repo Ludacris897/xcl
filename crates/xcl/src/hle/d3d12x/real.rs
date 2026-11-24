@@ -3560,6 +3560,22 @@ impl OwnedDesc {
             OwnedDesc::Stream(d, ..) => &**d as *const _ as *const c_void,
         }
     }
+
+    /// Estimated owned bytes retained by the lazy PSO job. Excludes allocator,
+    /// closure, map, and driver overhead, but captures the large shader blobs.
+    fn owned_bytes(&self) -> usize {
+        let blobs = |xs: &[Vec<u8>]| xs.iter().map(|x| x.capacity()).sum::<usize>();
+        match self {
+            OwnedDesc::Compute(d, xs) =>
+                std::mem::size_of_val(&**d) + blobs(xs),
+            OwnedDesc::Graphics(d, xs, elems, names) =>
+                std::mem::size_of_val(&**d) + blobs(xs)
+                + elems.capacity() * std::mem::size_of::<D3D12_INPUT_ELEMENT_DESC>()
+                + names.iter().map(|x| x.as_bytes_with_nul().len()).sum::<usize>(),
+            OwnedDesc::Stream(d, buf, xs) =>
+                std::mem::size_of_val(&**d) + buf.capacity() + blobs(xs),
+        }
+    }
 }
 
 /// Copy a shader blob into `blobs` and point `b` at the copy.
@@ -3694,7 +3710,8 @@ unsafe fn go_background(
         return None;
     }
     let dev = Dev(this as usize, f as usize);
-    let submit = if super::pso_async::lazy() { super::pso_async::submit_lazy } else { super::pso_async::submit };
+    let captured_bytes = owned.owned_bytes();
+    let submit = if super::pso_async::lazy() { super::pso_async::submit_lazy_with_size } else { super::pso_async::submit_with_size };
     submit(
         *ppv as usize,
         compute,
@@ -3706,6 +3723,7 @@ unsafe fn go_background(
                 0
             }
         }),
+        captured_bytes,
     );
     Some(hr)
 }
