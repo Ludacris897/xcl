@@ -317,6 +317,51 @@ static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> =
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
 
+/// Optional profiling of the synchronous world-streaming hot path. Cumulative durations
+/// are microseconds. XCL_PERF=1 records timings but leaves the rendering policy unchanged.
+fn perf_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_PERF").is_ok_and(|v| !v.is_empty() && v != "0"))
+}
+
+static PERF_REFRESH: AtomicU64 = AtomicU64::new(0);
+static PERF_LOCK_US: AtomicU64 = AtomicU64::new(0);
+static PERF_REFRESH_US: AtomicU64 = AtomicU64::new(0);
+static PERF_WATCH_US: AtomicU64 = AtomicU64::new(0);
+static PERF_SELECT_US: AtomicU64 = AtomicU64::new(0);
+static PERF_DETILE_US: AtomicU64 = AtomicU64::new(0);
+static PERF_GPU_BATCH_US: AtomicU64 = AtomicU64::new(0);
+static PERF_BATCHES: AtomicU64 = AtomicU64::new(0);
+static PERF_BYTES: AtomicU64 = AtomicU64::new(0);
+
+fn perf_note(counter: &AtomicU64, duration: std::time::Duration) {
+    if perf_enabled() {
+        counter.fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+fn perf_report() {
+    if !perf_enabled() {
+        return;
+    }
+    let n = PERF_REFRESH.fetch_add(1, Ordering::Relaxed) + 1;
+    if n < 64 || !n.is_power_of_two() {
+        return;
+    }
+    let us = |a: &AtomicU64| a.load(Ordering::Relaxed) / 1000;
+    crate::xlog_info!(
+        "XCL PERF texture refresh: {n} calls, {} ms total, lock {} ms, write-watch {} ms, texture selection {} ms, CPU detile {} ms, GPU batch+wait {} ms ({} batches, {} MiB staged)",
+        us(&PERF_REFRESH_US),
+        us(&PERF_LOCK_US),
+        us(&PERF_WATCH_US),
+        us(&PERF_SELECT_US),
+        us(&PERF_DETILE_US),
+        us(&PERF_GPU_BATCH_US),
+        PERF_BATCHES.load(Ordering::Relaxed),
+        PERF_BYTES.load(Ordering::Relaxed) >> 20
+    );
+}
+
 /// Number of textures kept in title memory and uploads done so far.
 pub fn counts() -> (usize, u64) {
     (TEXTURES.lock().unwrap().by_res.len(), UPLOADS.load(Ordering::Relaxed))
@@ -656,8 +701,16 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
     if BUSY.with(|b| b.get()) {
         return;
     }
+    let t0 = perf_enabled().then(std::time::Instant::now);
     let _refresh = REFRESH.lock().unwrap();
+    if let Some(t) = t0 {
+        perf_note(&PERF_LOCK_US, t.elapsed());
+    }
     own_work(|| refresh_once(queue));
+    if let Some(t) = t0 {
+        perf_note(&PERF_REFRESH_US, t.elapsed());
+    }
+    perf_report();
 }
 
 unsafe fn refresh_once(queue: *mut c_void) {
@@ -695,6 +748,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    perf_note(&PERF_WATCH_US, watch_t0.elapsed());
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)
@@ -737,6 +791,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
+    let select_t0 = perf_enabled().then(std::time::Instant::now);
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
@@ -762,6 +817,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
             })
             .collect()
     });
+    if let Some(t) = select_t0 {
+        perf_note(&PERF_SELECT_US, t.elapsed());
+    }
     upload_all(todo);
 }
 
@@ -788,7 +846,12 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
             device = dev;
             bytes += tex.size() as usize;
+            let detile_t0 = perf_enabled().then(std::time::Instant::now);
             let subs = subresources(va, &tex);
+            if let Some(t) = detile_t0 {
+                perf_note(&PERF_DETILE_US, t.elapsed());
+                PERF_BYTES.fetch_add(subs.iter().map(|s| s.data.len() as u64).sum::<u64>(), Ordering::Relaxed);
+            }
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
@@ -803,10 +866,16 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 continue;
             }
         };
-        match own_work(|| {
+        let gpu_t0 = perf_enabled().then(std::time::Instant::now);
+        let upload_result = own_work(|| {
             super::vram::before_execute(&queue);
             texture::upload_batch(dev, &queue, &batch)
-        }) {
+        });
+        if let Some(t) = gpu_t0 {
+            perf_note(&PERF_GPU_BATCH_US, t.elapsed());
+            PERF_BATCHES.fetch_add(1, Ordering::Relaxed);
+        }
+        match upload_result {
             Ok(failed) => {
                 for (_, e) in failed {
                     warn(&e);
