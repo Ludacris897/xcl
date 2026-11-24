@@ -324,6 +324,8 @@ pub fn counts() -> (usize, u64) {
 
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
+    // (a new texture object, or the address of an old one again: its first upload is not left out)
+    LAST_CONTENT.lock().unwrap().remove(&(res as usize));
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
     // the console's 32-bit 116 / 117 floats are half floats on the PC (`pc_resource_desc`): the
     // title's bytes are not the resource's texels
@@ -495,6 +497,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
 
 /// The PC texture was released for good.
 pub fn forget(res: usize) {
+    LAST_CONTENT.lock().unwrap().remove(&res);
     let (removed, to_remap) = {
         let mut t = TEXTURES.lock().unwrap();
         let (removed, delta, remap_ptrs) = t.remove(res);
@@ -765,6 +768,41 @@ unsafe fn refresh_once(queue: *mut c_void) {
     upload_all(todo);
 }
 
+/// texture → `content_hash` of its memory at its last upload
+static LAST_CONTENT: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+static UNCHANGED: AtomicU64 = AtomicU64::new(0);
+
+/// `XCL_TEXTURE_SKIP_UNCHANGED=0` uploads a texture whenever its pages were written, as before.
+fn unchanged_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TEXTURE_SKIP_UNCHANGED").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Whether texture `res` was last uploaded from memory with hash `h`; `h` is remembered as its
+/// content from here on (the caller uploads it when this is false).
+fn same_as_last_upload(res: usize, h: u64) -> bool {
+    LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
+}
+
+/// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
+/// 8-byte words: gigabytes a second; not for anything adversarial).
+fn content_hash(b: &[u8]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = [K, K.rotate_left(17), K.rotate_left(31), K.rotate_left(47)];
+    let mut chunks = b.chunks_exact(32);
+    for c in &mut chunks {
+        for (k, lane) in h.iter_mut().enumerate() {
+            let v = u64::from_le_bytes(c[k * 8..k * 8 + 8].try_into().unwrap());
+            *lane = (*lane ^ v).wrapping_mul(K).rotate_left(29);
+        }
+    }
+    let mut tail = b.len() as u64;
+    for (k, &x) in chunks.remainder().iter().enumerate() {
+        tail = (tail ^ ((x as u64) << (8 * (k % 8)))).wrapping_mul(K).rotate_left(23);
+    }
+    h.iter().fold(tail, |a, &l| (a ^ l).wrapping_mul(K).rotate_left(27))
+}
+
 /// staging bytes of one batch at most
 const BATCH_BYTES: usize = 256 << 20;
 
@@ -778,17 +816,35 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
     };
     let mut todo = todo.into_iter().peekable();
     while todo.peek().is_some() {
-        let mut batch = Vec::new();
+        let mut picked = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
         while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            if !batch.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
+            if !picked.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
+            // The same bytes as at this texture's last upload: nothing to do. The write watch is
+            // per page and a title writes next to its textures (and rewrites what it wrote): a
+            // retail title's video planes and UI targets went up again for every submit, ~25 MB
+            // a presented frame where ~3 MB had changed, and the submits waited here.
+            if unchanged_skip() {
+                let h = content_hash(&title_bytes(va, tex.size() as usize));
+                if same_as_last_upload(r.as_raw() as usize, h) {
+                    let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || (n.is_power_of_two() && n >= 1024) {
+                        crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
+                    }
+                    continue;
+                }
+            }
             device = dev;
             bytes += tex.size() as usize;
-            let subs = subresources(va, &tex);
+            picked.push((r, va, tex, states));
+        }
+        let subs = subresources_of_all(&picked, bytes);
+        let mut batch = Vec::with_capacity(picked.len());
+        for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
@@ -994,18 +1050,72 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     out
 }
 
+/// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
+const PARALLEL_BYTES: usize = 1 << 20;
+
+/// `subresources` of every texture of a batch (`bytes` of them), in order: on several threads
+/// when the batch is big. They were read and detiled one after another in the title's own
+/// submit – most of a retail game's render thread while it streamed textures the CPU writes.
+unsafe fn subresources_of_all(picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>)], bytes: usize) -> Vec<Vec<Subresource>> {
+    let picked: Vec<(usize, &xg::Texture)> = picked.iter().map(|(_, va, tex, _)| (*va, &**tex)).collect();
+    let threads = if bytes < PARALLEL_BYTES { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8) };
+    subresources_on(&picked, threads)
+}
+
+/// `subresources` of each (address, texture), in order, on up to `threads` threads.
+unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> Vec<Vec<Subresource>> {
+    let threads = threads.min(picked.len());
+    if threads <= 1 {
+        return picked.iter().map(|&(va, tex)| subresources(va, tex)).collect();
+    }
+    // the next texture to take; each thread hands back (index, subresources)
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut out: Vec<Vec<Subresource>> = (0..picked.len()).map(|_| Vec::new()).collect();
+    let done: Vec<Vec<(usize, Vec<Subresource>)>> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(va, tex)) = picked.get(k) else { break };
+                        // SAFETY: as in the serial path – the title's memory is only read
+                        mine.push((k, unsafe { subresources(va, tex) }));
+                    }
+                    mine
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap_or_default()).collect()
+    });
+    for (k, subs) in done.into_iter().flatten() {
+        out[k] = subs;
+    }
+    out
+}
+
+/// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
+/// as much as the detile of a video frame), else read page run by page run.
+unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
+    if crate::gpu::shader::readable(at, len) {
+        std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
+    } else {
+        std::borrow::Cow::Owned(read_committed(at, len))
+    }
+}
+
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
 unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     let Some(tex) = tex.texels() else { return Vec::new() };
     let c = &tex.chain;
     let bpe = tex.bpe as usize;
     if tex.depth > 0 {
-        let mem = read_committed(va, tex.size() as usize);
+        let mem = title_bytes(va, tex.size() as usize);
         return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(&mem, i) }).collect();
     }
     let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
     for s in 0..tex.array as usize {
-        let slice = read_committed(va + s * c.slice_bytes, c.slice_bytes);
+        let slice = title_bytes(va + s * c.slice_bytes, c.slice_bytes);
         for (i, l) in c.levels.iter().enumerate() {
             out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(&slice, i, s) });
         }
@@ -1017,6 +1127,35 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A texture is left out only when its memory hashes as at its own last upload, and a
+    /// texture that was forgotten (released, or its address registered again) is uploaded again.
+    #[test]
+    fn a_texture_with_unchanged_memory_is_left_out_until_it_is_forgotten() {
+        let (a, b) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize);
+        let mut mem = vec![0u8; 3 << 20];
+        mem[5] = 1;
+        let h = content_hash(&mem);
+        assert!(!same_as_last_upload(a, h), "the first upload is not left out");
+        assert!(same_as_last_upload(a, h), "the same bytes again: left out");
+        assert!(!same_as_last_upload(b, h), "another texture over the same bytes has its own first upload");
+        // one byte anywhere, also in the tail that is not a whole 32-byte step
+        for at in [0usize, 31, 32, (3 << 20) - 1] {
+            let mut m = mem.clone();
+            m[at] ^= 0x80;
+            assert_ne!(content_hash(&m), h, "byte {at} changed");
+        }
+        mem[(3 << 20) - 1] = 9;
+        let h2 = content_hash(&mem);
+        assert!(!same_as_last_upload(a, h2), "changed memory is uploaded");
+        assert!(same_as_last_upload(a, h2));
+        // the length is part of the content: a prefix of zeros is not the whole
+        assert_ne!(content_hash(&[0u8; 64]), content_hash(&[0u8; 96]));
+        forget(a);
+        assert!(!same_as_last_upload(a, h2), "forgotten: its next upload is a first one");
+        forget(a);
+        forget(b);
+    }
 
     /// Real uploads, dirty-page detection and a source changing after registration:
     /// bookkeeping alone cannot show that the bytes the GPU sees follow the mirror.
@@ -1283,6 +1422,30 @@ mod tests {
         assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
     }
 
+    /// The title's bytes are used where they are when all of them are readable, and read with the
+    /// pages that are not committed as zeros otherwise – the same bytes either way.
+    #[test]
+    fn title_bytes_are_used_in_place_when_all_are_readable() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 << 12, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            for page in [0usize, 2] {
+                VirtualAlloc((base + (page << 12)) as *const c_void, 1 << 12, MEM_COMMIT, PAGE_READWRITE);
+                std::ptr::write_bytes((base + (page << 12)) as *mut u8, 0xA0 + page as u8, 1 << 12);
+            }
+            let whole = title_bytes(base, 1 << 12);
+            assert!(matches!(whole, std::borrow::Cow::Borrowed(_)), "a committed page is not copied");
+            assert_eq!(whole.as_ptr() as usize, base);
+            assert!(whole.iter().all(|&b| b == 0xA0));
+            let holed = title_bytes(base, 3 << 12);
+            assert!(matches!(holed, std::borrow::Cow::Owned(_)), "a range with a reserved page is read");
+            assert_eq!(&holed[..], &read_committed(base, 3 << 12)[..]);
+            assert!(holed[..1 << 12].iter().all(|&b| b == 0xA0) && holed[1 << 12..2 << 12].iter().all(|&b| b == 0) && holed[2 << 12..].iter().all(|&b| b == 0xA2));
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
     /// Only the wanted parts of the watched regions are scanned, merged, one region each.
     #[test]
     fn watch_ranges_clip_and_merge() {
@@ -1292,6 +1455,32 @@ mod tests {
         // ranges a gap of under 1 MiB apart: one scan; further apart: two
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000)]);
+    }
+
+    /// The textures of a batch detiled on several threads come back as on one: complete and in
+    /// order (2D with mips and slices, 3D, BC7, a tiny one; more textures than threads).
+    #[test]
+    fn a_batch_detiled_on_several_threads_matches_one_thread() {
+        let descs = [
+            console_desc(3, 64, 64, 2, 3, 28, 0x105),
+            console_desc(3, 200, 72, 1, 5, 28, 0x105),
+            console_desc(4, 40, 24, 6, 3, 28, 0x105),
+            console_desc(3, 256, 256, 1, 9, 98, 0x10A),
+            console_desc(3, 4, 4, 1, 1, 28, 0x105),
+            console_desc(3, 128, 32, 3, 2, 28, 0x105),
+            console_desc(3, 64, 64, 1, 1, 28, 0x105),
+        ];
+        let textures: Vec<xg::Texture> = descs.iter().map(|d| xg::Texture::new(d).unwrap()).collect();
+        // each texture's console memory: distinct bytes per texture
+        let mems: Vec<Vec<u8>> = textures.iter().enumerate().map(|(t, x)| (0..x.size() as usize).map(|i| (i * 7 + t * 61) as u8).collect()).collect();
+        let picked: Vec<(usize, &xg::Texture)> = mems.iter().zip(&textures).map(|(m, x)| (m.as_ptr() as usize, x)).collect();
+        unsafe {
+            let one = subresources_on(&picked, 1);
+            assert!(one.iter().all(|s| !s.is_empty()), "a texture gave no subresources");
+            for threads in [2, 3, 8] {
+                assert!(subresources_on(&picked, threads) == one, "{threads} threads differ from one");
+            }
+        }
     }
 
     fn console_desc(dim: u32, w: u64, h: u32, array_or_depth: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {
