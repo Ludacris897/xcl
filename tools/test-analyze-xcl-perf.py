@@ -24,6 +24,26 @@ xcl: sparse windows timing: write-watch 7 ms (240 dirty pages), lock wait 2 ms, 
         self.assertEqual(obj["texture_ranked_hotspots_ms"][0], ("gpu_batch_wait_ms", 56))
         self.assertEqual(obj["sparse_cumulative"]["dirty_pages"], 240)
 
+    def test_watch_query_and_report_summary(self):
+        log = ("XCL PERF GetWriteWatch: 64 calls, 12 GiB of ranges scanned cumulatively, "
+               "slowest call 40200 us (4194304 KiB region), 2 failed calls, "
+               "gap merge threshold 64 KiB")
+        obj = perf.summarize(log)
+        self.assertEqual(obj["get_write_watch_cumulative"]["slowest_call_us"], 40200)
+        self.assertEqual(obj["get_write_watch_cumulative"]["gap_kib"], 64)
+        report = {
+            "crash": "unhandled exception 0xc0000005 in game.exe+0x20 rax=0x0",
+            "d3d12": {"presents": 12, "failed_pipelines": 3, "translated_pipelines": 20},
+            "dstorage": {"bcpack_refused": {"BC1": {"requests": 9, "destination_bytes": 1048576}}},
+            "shaders": {"unique": 100},
+            "called_stubs": [{"function": "GraphicsList::#142", "calls": 10}],
+        }
+        r = perf.summarize_report(report)
+        self.assertEqual(r["bcpack_refused"]["BC1"]["destination_mib"], 1.0)
+        self.assertEqual(r["console_stub_calls"]["GraphicsList::#142"], 10)
+        self.assertEqual(r["unique_shaders"], 100)
+        self.assertNotIn("rax=", r["crash"])
+
     def test_empty_log_is_well_defined(self):
         obj = perf.summarize("")
         self.assertEqual(obj["activity_intervals"], 0)
