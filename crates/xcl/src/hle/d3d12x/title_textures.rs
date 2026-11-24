@@ -395,6 +395,10 @@ fn perf_report() {
     }
     let (reused, created) = texture::wait_cache_counts();
     crate::xlog_info!("XCL PERF texture fence waits: {reused} reused, {created} newly allocated (bounded per-thread cache)");
+    let (batches, textures, mib, fallbacks) = texture::coalescing_stats();
+    if batches > 0 || fallbacks > 0 {
+        crate::xlog_info!("XCL PERF coalesced upload: {batches} batches, {textures} textures, {mib} MiB staging, {fallbacks} oversized/allocation fallbacks");
+    }
 }
 
 /// Number of textures kept in title memory and uploads done so far.
