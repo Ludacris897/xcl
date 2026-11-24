@@ -26,7 +26,8 @@
 //! Each queue has a worker thread: submitted requests run in order (file reads through the
 //! VFS like the title's own, memory copies, zlib), a status entry gets the first failure of
 //! the requests since the previous one, a signal sets the fence from the CPU. Methods not
-//! listed are logged and answer E_NOTIMPL; BCPack and other console formats are refused.
+//! listed are logged and answer E_NOTIMPL; BCPack is refused by default. An opt-in
+//! experimental BC1-only path is available; other codecs and swizzles remain refused.
 
 #![allow(non_snake_case)]
 
@@ -153,12 +154,23 @@ fn decode_bcpack_bc1(stream: &[u8], destination_bytes: usize) -> Result<Vec<u8>,
     if destination_bytes == 0 || destination_bytes % 8 != 0 || destination_bytes > 32 << 20 {
         return Err(E_DECOMPRESSION);
     }
+    static FAILURES: AtomicU64 = AtomicU64::new(0);
+    let reject = |why: &str| {
+        let n = FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            crate::xlog_warn!("DirectStorage: experimental BC1 BCPack decode failure #{n}: {why} (compressed {} bytes, destination {destination_bytes} bytes)", stream.len());
+        }
+        E_DECOMPRESSION
+    };
     let output = bcpack::bc1::decode(stream, destination_bytes / 8, window, quads)
-        .map_err(|_| E_DECOMPRESSION)?;
+        .map_err(|_| reject("entropy/block decode failed"))?;
     // The fitted window has two unknown entries; don't silently deliver
     // guessed texels when one was referenced by a chunk.
-    if output.blocks.len() != destination_bytes || output.unfitted_blocks != 0 {
-        return Err(E_DECOMPRESSION);
+    if output.blocks.len() != destination_bytes {
+        return Err(reject("unexpected output size"));
+    }
+    if output.unfitted_blocks != 0 {
+        return Err(reject("unfitted BC1 endpoint table entry was needed"));
     }
     static OK: AtomicU64 = AtomicU64::new(0);
     let count = OK.fetch_add(1, Ordering::Relaxed) + 1;
@@ -168,7 +180,7 @@ fn decode_bcpack_bc1(stream: &[u8], destination_bytes: usize) -> Result<Vec<u8>,
     Ok(output.blocks)
 }
 
-/// BCPack requests refused at enqueue (XCL has no BCPack decoder), by mode.
+/// BCPack requests refused at enqueue, by mode (the optional BC1 decoder is opt-in).
 struct BcpackRefusals {
     requests: [AtomicU64; 16],
     with_zlib: [AtomicU64; 16],
@@ -232,7 +244,7 @@ pub struct BcpackStats {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DStorageStats {
-    /// BCPack requests refused (no decoder), by `DSTORAGE_BCPACK_MODE`
+    /// BCPack requests refused at enqueue, by `DSTORAGE_BCPACK_MODE`
     pub bcpack_refused: BTreeMap<String, BcpackStats>,
 }
 
@@ -723,8 +735,8 @@ impl Request {
                     return Err(E_DESTINATION_SIZE);
                 }
             }
-            // Two-stage zlib -> BCPack: validate intermediate bounds when supplied, then refuse BCPack
-            // (counted and logged at enqueue, `BcpackRefusals`).
+            // Two-stage zlib -> BCPack: validate intermediate bounds; only BC1 may
+            // proceed when the experimental feature and runtime flag are enabled.
             (true, _) => {
                 if self.intermediate_size != 0 && (self.intermediate_size <= self.source_size || self.destination_size <= self.intermediate_size) {
                     return Err(E_DESTINATION_SIZE);
@@ -733,7 +745,7 @@ impl Request {
                     return Err(E_DECOMPRESSION);
                 }
             }
-            // Single-stage BCPack: `intermediate_size` must be 0, then refuse BCPack.
+            // Single-stage BCPack: intermediate_size must be 0; only opt-in BC1 may proceed.
             (false, _) => {
                 if self.intermediate_size != 0 {
                     return Err(E_DESTINATION_SIZE);
