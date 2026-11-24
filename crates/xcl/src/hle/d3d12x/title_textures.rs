@@ -778,10 +778,18 @@ fn unchanged_skip() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_TEXTURE_SKIP_UNCHANGED").map_or(true, |v| v.trim() != "0"))
 }
 
-/// Whether texture `res` was last uploaded from memory with hash `h`; `h` is remembered as its
-/// content from here on (the caller uploads it when this is false).
+/// Compare against the last *successful* upload, without modifying the cache.
 fn same_as_last_upload(res: usize, h: u64) -> bool {
-    LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
+    LAST_CONTENT.lock().unwrap().get(&res).copied() == Some(h)
+}
+
+/// Invalidate an unsuccessful upload; never advertise its bytes as GPU contents.
+fn finish_upload_hash(res: usize, hash: Option<u64>, success: bool) {
+    let mut cache = LAST_CONTENT.lock().unwrap();
+    match (hash, success) {
+        (Some(h), true) => { cache.insert(res, h); }
+        _ => { cache.remove(&res); }
+    }
 }
 
 /// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
@@ -817,6 +825,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
     let mut todo = todo.into_iter().peekable();
     while todo.peek().is_some() {
         let mut picked = Vec::new();
+        let mut hashes = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
         while let Some((_, (dev, _, tex, _))) = todo.peek() {
@@ -828,8 +837,8 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             // per page and a title writes next to its textures (and rewrites what it wrote): a
             // retail title's video planes and UI targets went up again for every submit, ~25 MB
             // a presented frame where ~3 MB had changed, and the submits waited here.
-            if unchanged_skip() {
-                let h = content_hash(&title_bytes(va, tex.size() as usize));
+            let hash = unchanged_skip().then(|| content_hash(&title_bytes(va, tex.size() as usize)));
+            if let Some(h) = hash {
                 if same_as_last_upload(r.as_raw() as usize, h) {
                     let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || (n.is_power_of_two() && n >= 1024) {
@@ -840,8 +849,10 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
             device = dev;
             bytes += tex.size() as usize;
+            hashes.push(hash);
             picked.push((r, va, tex, states));
         }
+        if picked.is_empty() { continue; }
         let subs = subresources_of_all(&picked, bytes);
         let mut batch = Vec::with_capacity(picked.len());
         for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
@@ -851,10 +862,19 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             batch.push((r, subs, states));
         }
         let d = device as *mut c_void;
-        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
+        let invalidate = || {
+            for (r, _, _) in &batch {
+                finish_upload_hash(r.as_raw() as usize, None, false);
+            }
+        };
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else {
+            invalidate();
+            continue;
+        };
         let queue = match upload_queue(dev, device) {
             Ok(q) => q,
             Err(e) => {
+                invalidate();
                 warn(&e);
                 continue;
             }
@@ -864,12 +884,20 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             texture::upload_batch(dev, &queue, &batch)
         }) {
             Ok(failed) => {
-                for (_, e) in failed {
+                let mut successful = vec![true; batch.len()];
+                for (i, e) in failed {
+                    if let Some(ok) = successful.get_mut(i) { *ok = false; }
                     warn(&e);
                 }
-                UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                for (i, (r, _, _)) in batch.iter().enumerate() {
+                    finish_upload_hash(r.as_raw() as usize, hashes[i], successful[i]);
+                }
+                UPLOADS.fetch_add(successful.iter().filter(|&&ok| ok).count() as u64, Ordering::Relaxed);
             }
-            Err(e) => warn(&e),
+            Err(e) => {
+                invalidate();
+                warn(&e);
+            }
         }
     }
 }
@@ -1137,6 +1165,8 @@ mod tests {
         mem[5] = 1;
         let h = content_hash(&mem);
         assert!(!same_as_last_upload(a, h), "the first upload is not left out");
+        assert!(!same_as_last_upload(a, h), "lookup alone never commits a hash");
+        finish_upload_hash(a, Some(h), true);
         assert!(same_as_last_upload(a, h), "the same bytes again: left out");
         assert!(!same_as_last_upload(b, h), "another texture over the same bytes has its own first upload");
         // one byte anywhere, also in the tail that is not a whole 32-byte step
@@ -1148,6 +1178,10 @@ mod tests {
         mem[(3 << 20) - 1] = 9;
         let h2 = content_hash(&mem);
         assert!(!same_as_last_upload(a, h2), "changed memory is uploaded");
+        finish_upload_hash(a, Some(h2), false);
+        assert!(!same_as_last_upload(a, h2), "failed upload must not be skipped");
+        assert!(!same_as_last_upload(a, h), "old content is uncertain after a failed copy");
+        finish_upload_hash(a, Some(h2), true);
         assert!(same_as_last_upload(a, h2));
         // the length is part of the content: a prefix of zeros is not the whole
         assert_ne!(content_hash(&[0u8; 64]), content_hash(&[0u8; 96]));
