@@ -987,11 +987,37 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
         let end = (m.BaseAddress as usize + m.RegionSize).min(at + len);
         let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0; // R / RW / WC / X-R…, no guard
         if readable {
-            std::ptr::copy_nonoverlapping(p as *const u8, out.as_mut_ptr().add(p - at), end - p);
+            read_own_or_zero(p, out.as_mut_ptr().add(p - at), end - p);
         }
         p = end;
     }
     out
+}
+
+/// `len` bytes at `at` into `out`, read without touching them from this thread: a title thread
+/// can decommit or unmap pages between the `VirtualQuery` above and the copy (a retail game's
+/// world load ended in memcpy here, on a page the query had just reported committed). Pages
+/// that cannot be read stay zero.
+unsafe fn read_own_or_zero(at: usize, out: *mut u8, len: usize) {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let read = |a: usize, o: *mut u8, n: usize| {
+        let mut done = 0usize;
+        ReadProcessMemory(GetCurrentProcess(), a as *const c_void, o as *mut c_void, n, &mut done) != 0 && done == n
+    };
+    if read(at, out, len) {
+        return;
+    }
+    // something went away: page by page, the pages that cannot be read zero
+    let mut p = at;
+    while p < at + len {
+        let n = (((p | 0xFFF) + 1).min(at + len)) - p;
+        let o = out.add(p - at);
+        if !read(p, o, n) {
+            std::ptr::write_bytes(o, 0, n);
+        }
+        p += n;
+    }
 }
 
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
@@ -1630,6 +1656,26 @@ mod tests {
                 drop(res);
             }
             uma.free(base);
+        }
+    }
+
+    /// A page that went away between the `VirtualQuery` and the copy reads as zero; the pages
+    /// around it are copied (the copy itself used to fault there).
+    #[test]
+    fn read_own_or_zero_zeroes_a_page_that_is_gone() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const PAGE: usize = 0x1000;
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            std::ptr::write_bytes(base as *mut u8, 0xAB, 3 * PAGE);
+            assert_ne!(VirtualFree((base + PAGE) as *mut c_void, PAGE, MEM_DECOMMIT), 0);
+            let mut out = vec![0x55u8; 3 * PAGE - 0x10];
+            read_own_or_zero(base + 0x10, out.as_mut_ptr(), out.len());
+            assert!(out[..PAGE - 0x10].iter().all(|&b| b == 0xAB), "the first page is copied");
+            assert!(out[PAGE - 0x10..2 * PAGE - 0x10].iter().all(|&b| b == 0), "the page that is gone reads as zero");
+            assert!(out[2 * PAGE - 0x10..].iter().all(|&b| b == 0xAB), "the last page is copied");
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
     }
 }
