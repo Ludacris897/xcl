@@ -13,6 +13,8 @@
 use super::desc::{self, Image, ImageType};
 use super::fence;
 use super::tiling::{self, Chain, PipeConfig};
+use std::cell::RefCell;
+use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
 /// Pipes / packers of the console's GB_ADDR_CONFIG – only the XOR (_X) modes depend on it.
@@ -311,13 +313,64 @@ fn transitions(r: &ID3D12Resource, from: &[D3D12_RESOURCE_STATES], to: &[D3D12_R
     (0..n).filter(|&k| at(from, k) != at(to, k)).map(|k| transition_sub(r, k as u32, at(from, k), at(to, k))).collect()
 }
 
+/// A texture upload currently waits for GPU completion before dropping its staging
+/// allocations. Reuse the fence instead of paying for CreateFence at *every* batch.
+/// Keep queue/device COM refs alongside raw identities to prevent address reuse.
+struct UploadWait {
+    device: ID3D12Device,
+    queue: ID3D12CommandQueue,
+    fence: ID3D12Fence,
+    value: u64,
+}
+
+/// Bounded per-thread cache: XCL's texture refresh is serialized, but diagnostic
+/// readbacks and other upload callers may use different queues or threads.
+/// Per-thread ownership avoids a global mutex across a GPU wait.
+thread_local! {
+    static WAIT_CACHE: RefCell<Vec<UploadWait>> = const { RefCell::new(Vec::new()) };
+}
+
 /// Wait until `queue` has run everything submitted so far.
+///
+/// The previous implementation allocated an ID3D12Fence on every call; a world
+/// load can issue thousands of small upload batches and incur repeated driver
+/// object creation. The new implementation retains at most four fences per
+/// thread, each with monotonically increasing targets; it *does not* remove
+/// GPU waits or change staging-resource lifetimes.
 pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(), String> {
     let copy_error = |e| format!("texture copy: {e}");
-    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
-        .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
-    queue.Signal(&fence, 1).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
-    fence::wait(&fence, 1, dev, None, 10_000).map_err(copy_error)
+    let (fence, value) = WAIT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(entry) = cache.iter_mut().find(|e|
+            e.queue.as_raw() == queue.as_raw() && e.device.as_raw() == dev.as_raw()
+        ) {
+            // On theoretical u64 rollover, start a new fence so a completed
+            // signal cannot satisfy a future wait accidentally.
+            if let Some(next) = entry.value.checked_add(1) {
+                entry.value = next;
+                return Ok((entry.fence.clone(), next));
+            }
+            let fresh = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
+            entry.fence = fresh.clone();
+            entry.value = 1;
+            return Ok((fresh, 1));
+        }
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
+            .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
+        if cache.len() == 4 {
+            cache.remove(0);
+        }
+        cache.push(UploadWait {
+            device: dev.clone(),
+            queue: queue.clone(),
+            fence: fence.clone(),
+            value: 1,
+        });
+        Ok((fence, 1))
+    })?;
+    queue.Signal(&fence, value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+    fence::wait(&fence, value, dev, None, 10_000).map_err(copy_error)
 }
 
 unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String> {
