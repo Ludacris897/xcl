@@ -219,6 +219,46 @@ mod tests {
         }
     }
 
+    /// A blocked queue must not prevent an independent queue from publishing a completed write.
+    #[test]
+    fn independent_queue_writeback_is_not_blocked_by_other_queue() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.unwrap();
+            let desc = D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() };
+            let blocked: ID3D12CommandQueue = dev.CreateCommandQueue(&desc).unwrap();
+            let ready: ID3D12CommandQueue = dev.CreateCommandQueue(&desc).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let a = Box::new(AtomicU32::new(0));
+            let b = Box::new(AtomicU32::new(0));
+            blocked.Wait(&gate, 1).unwrap();
+            after(blocked.as_raw(), vec![Write::Immediate(&*a as *const AtomicU32 as usize, vec![17])]);
+            after(ready.as_raw(), vec![Write::Immediate(&*b as *const AtomicU32 as usize, vec![23])]);
+            let start = std::time::Instant::now();
+            while b.load(Ordering::Acquire) == 0 && start.elapsed().as_secs() < 3 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let independent = b.load(Ordering::Acquire) == 23 && a.load(Ordering::Acquire) == 0;
+            gate.Signal(1).unwrap();
+            let start = std::time::Instant::now();
+            while (a.load(Ordering::Acquire) == 0 || b.load(Ordering::Acquire) == 0) && start.elapsed().as_secs() < 5 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let completed = a.load(Ordering::Acquire) == 17 && b.load(Ordering::Acquire) == 23;
+            forget_queue(blocked.as_raw() as usize);
+            forget_queue(ready.as_raw() as usize);
+            // A failed test must not release cells still referenced by an asynchronous job.
+            if !completed { std::mem::forget(a); std::mem::forget(b); }
+            assert!(completed, "both writebacks must finish after gate signal");
+            assert!(independent, "independent queue must publish before blocked queue is released");
+        }
+    }
+
     /// A ReadbackU64 write copies the 64-bit value from the mapped readback buffer after the queue finishes.
     #[test]
     fn readback_u64_lands_after_the_queue() {
