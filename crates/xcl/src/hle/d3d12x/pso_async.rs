@@ -273,6 +273,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn owned_job_payload_is_released_on_completion_and_abandonment() {
+        let first = usize::MAX - 0x3300;
+        let second = usize::MAX - 0x4400;
+        let baseline = captured_memory().0;
+        submit_lazy_with_size(first, true, Box::new(|| 0), 8192);
+        assert_eq!(captured_memory().0, baseline + 8192);
+        assert_eq!(resolve_for_bind(first), first);
+        assert_eq!(captured_memory().0, baseline);
+        assert_eq!(released(first), 0);
+
+        submit_lazy_with_size(second, false, Box::new(|| 0), 4096);
+        assert_eq!(captured_memory().0, baseline + 4096);
+        assert_eq!(released(second), 0);
+        assert_eq!(captured_memory().0, baseline);
+    }
+
+    #[test]
     fn lazy_compute_job_resolves_and_retires_without_worker() {
         // No real D3D12 pipeline is created. A zero result stays the stand-in.
         let standin = usize::MAX - 0x1000;
