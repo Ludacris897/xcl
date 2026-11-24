@@ -699,6 +699,25 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
+    // the bytes of `dst` the rows go to: a destination that is not committed memory is refused
+    // (a retail game's copy wrote into a page that was not, and the process ended in memcpy)
+    let span = if t.depth > 0 { (m.depth - 1) * slice_pitch as usize } else { 0 } + (m.height - 1) * row_pitch as usize + row;
+    if !crate::gpu::shader::readable(dst as usize, span) {
+        static N: AtomicU32 = AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_warn!(
+                "XGTextureAddressComputer::CopyFromSubresource: destination {:#x}..{:#x} is not committed memory – refused (plane {plane}, subresource {sub}, level {i} {}x{}x{}, {} bytes a row, row pitch {row_pitch}, slice pitch {slice_pitch}, source {:#x})",
+                dst as usize,
+                dst as usize + span,
+                m.width,
+                m.height,
+                m.depth,
+                row,
+                src as usize
+            );
+        }
+        return E_INVALIDARG;
+    }
     if t.depth > 0 {
         let linear = t.chain.detile_volume(std::slice::from_raw_parts(src.add(at as usize), t.size() as usize), i);
         for (n, from) in linear.chunks_exact(row).enumerate() {
