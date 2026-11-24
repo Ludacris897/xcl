@@ -14,6 +14,7 @@ use super::desc::{self, Image, ImageType};
 use super::fence;
 use super::tiling::{self, Chain, PipeConfig};
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -338,6 +339,13 @@ impl Drop for UploadWait {
 thread_local! {
     static WAIT_CACHE: RefCell<Vec<UploadWait>> = const { RefCell::new(Vec::new()) };
 }
+static WAIT_REUSED: AtomicU64 = AtomicU64::new(0);
+static WAIT_CREATED: AtomicU64 = AtomicU64::new(0);
+
+/// (reused upload fences, new upload fences) across all threads.
+pub fn wait_cache_counts() -> (u64, u64) {
+    (WAIT_REUSED.load(Ordering::Relaxed), WAIT_CREATED.load(Ordering::Relaxed))
+}
 
 /// Wait until `queue` has run everything submitted so far.
 ///
@@ -357,12 +365,14 @@ pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(),
             // signal cannot satisfy a future wait accidentally.
             if let Some(next) = entry.value.checked_add(1) {
                 entry.value = next;
+                WAIT_REUSED.fetch_add(1, Ordering::Relaxed);
                 return Ok((entry.fence.clone(), next, entry.event));
             }
             let fresh = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
                 .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
             entry.fence = fresh.clone();
             entry.value = 1;
+            WAIT_CREATED.fetch_add(1, Ordering::Relaxed);
             return Ok((fresh, 1, entry.event));
         }
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
@@ -379,6 +389,7 @@ pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(),
             value: 1,
             event,
         });
+        WAIT_CREATED.fetch_add(1, Ordering::Relaxed);
         Ok((fence, 1, event))
     })?;
     queue.Signal(&fence, value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
