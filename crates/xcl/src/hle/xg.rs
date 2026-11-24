@@ -694,23 +694,24 @@ unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, su
     S_OK
 }
 
-/// the level's place in the resource at `base + offset` → rows of `dst` (`row_pitch` apart).
-/// The resource comes as a base address and a byte offset from it: a retail game's calls, read
-/// as (base, row pitch, slice pitch), had the same base 0x7_0000_0000 for different textures, a
-/// "row pitch" of hundreds of MB and a "slice pitch" exactly one row of the level – and the
-/// first such copy ended the process in memcpy, its second row far outside the buffer.
-unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, base: *const u8, offset: u64, row_pitch: u32, slice_pitch: u32) -> HRESULT {
-    let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !base.is_null()) else { return E_INVALIDARG };
-    let src = base.wrapping_add(offset as usize);
+/// the level's place in the resource at `src` → rows of `dst` (`row_pitch` apart). A retail
+/// game's calls carry an 8-byte value before the resource (0x7_0000_0000 in every call seen,
+/// its meaning not known) and the resource after it: read as (resource, row pitch, slice
+/// pitch) a copy's second row went hundreds of MB past the buffer and the process ended in
+/// memcpy; read as (value, resource, row pitch, slice pitch) the resource is the CPU view of a
+/// title texture and the pitches are one row and one level (2048 / 262144 for 128x128 at 16
+/// bytes, 256 / 8192 for 32x32 at 8).
+unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, value: u64, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
+    let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
     static SEEN: AtomicU32 = AtomicU32::new(0);
     let seen = SEEN.fetch_add(1, Ordering::Relaxed);
     if seen < 4 {
         crate::xlog_info!(
-            "XGTextureAddressComputer::CopyFromSubresource #{seen}: destination {:#x}, plane {plane}, subresource {sub}, resource {:#x} + {offset:#x}, row pitch {row_pitch}, slice pitch {slice_pitch} (level {i} {}x{}x{}, {row} bytes a row)",
+            "XGTextureAddressComputer::CopyFromSubresource #{seen}: destination {:#x}, plane {plane}, subresource {sub}, value {value:#x}, resource {:#x}, row pitch {row_pitch}, slice pitch {slice_pitch} (level {i} {}x{}x{}, {row} bytes a row)",
             dst as usize,
-            base as usize,
+            src as usize,
             m.width,
             m.height,
             m.depth
