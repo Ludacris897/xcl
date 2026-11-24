@@ -26,7 +26,8 @@
 //! Each queue has a worker thread: submitted requests run in order (file reads through the
 //! VFS like the title's own, memory copies, zlib), a status entry gets the first failure of
 //! the requests since the previous one, a signal sets the fence from the CPU. Methods not
-//! listed are logged and answer E_NOTIMPL; BCPack and other console formats are refused.
+//! listed are logged and answer E_NOTIMPL; BCPack is refused by default. An opt-in
+//! experimental BC1-only path is available; other codecs and swizzles remain refused.
 
 #![allow(non_snake_case)]
 
@@ -131,7 +132,55 @@ fn bcpack_name(mode: u8) -> String {
     BCPACK_NAMES.get(mode as usize).map_or_else(|| format!("mode {mode}"), |n| n.to_string())
 }
 
-/// BCPack requests refused at enqueue (XCL has no BCPack decoder), by mode.
+/// Only opt-in BC1 from the pinned clean-room decoder; other BCn codecs
+/// remain explicitly refused. The default runtime behavior is unchanged.
+fn bcpack_bc1_enabled() -> bool {
+    #[cfg(feature = "bcpack-bc1")]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("XCL_BCPACK_BC1").is_ok_and(|v| v == "1"))
+    }
+    #[cfg(not(feature = "bcpack-bc1"))]
+    {
+        false
+    }
+}
+
+#[cfg(feature = "bcpack-bc1")]
+fn decode_bcpack_bc1(stream: &[u8], destination_bytes: usize) -> Result<Vec<u8>, HRESULT> {
+    use bcpack::bc1::{QuadTable, Window};
+    static TABLES: OnceLock<(Window, QuadTable)> = OnceLock::new();
+    let (window, quads) = TABLES.get_or_init(|| (Window::default_table(), QuadTable::default_table()));
+    if destination_bytes == 0 || destination_bytes % 8 != 0 || destination_bytes > 32 << 20 {
+        return Err(E_DECOMPRESSION);
+    }
+    static FAILURES: AtomicU64 = AtomicU64::new(0);
+    let reject = |why: &str| {
+        let n = FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            crate::xlog_warn!("DirectStorage: experimental BC1 BCPack decode failure #{n}: {why} (compressed {} bytes, destination {destination_bytes} bytes)", stream.len());
+        }
+        E_DECOMPRESSION
+    };
+    let output = bcpack::bc1::decode(stream, destination_bytes / 8, window, quads)
+        .map_err(|_| reject("entropy/block decode failed"))?;
+    // The fitted window has two unknown entries; don't silently deliver
+    // guessed texels when one was referenced by a chunk.
+    if output.blocks.len() != destination_bytes {
+        return Err(reject("unexpected output size"));
+    }
+    if output.unfitted_blocks != 0 {
+        return Err(reject("unfitted BC1 endpoint table entry was needed"));
+    }
+    static OK: AtomicU64 = AtomicU64::new(0);
+    let count = OK.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 4 || count.is_power_of_two() {
+        crate::xlog_info!("DirectStorage: experimental BC1 BCPack decoded {count} requests ({destination_bytes} bytes in this request)");
+    }
+    Ok(output.blocks)
+}
+
+/// BCPack requests refused at enqueue, by mode (the optional BC1 decoder is opt-in).
 struct BcpackRefusals {
     requests: [AtomicU64; 16],
     with_zlib: [AtomicU64; 16],
@@ -195,7 +244,7 @@ pub struct BcpackStats {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DStorageStats {
-    /// BCPack requests refused (no decoder), by `DSTORAGE_BCPACK_MODE`
+    /// BCPack requests refused at enqueue, by `DSTORAGE_BCPACK_MODE`
     pub bcpack_refused: BTreeMap<String, BcpackStats>,
 }
 
@@ -642,6 +691,18 @@ impl Request {
     }
 
     /// What a queue of `source_memory` refuses at enqueue.
+    /// A standalone BC1 chunk can be decoded into whole 8-byte blocks. Require
+    /// a known first-stage output length for zlib→BCPack requests; swizzles and
+    /// partial-block destinations are not supported by this experiment.
+    fn bcpack_bc1_shape(&self) -> bool {
+        self.bcpack() == 1
+            && self.swizzle() == 0
+            && self.destination_size > 0
+            && self.destination_size % 8 == 0
+            && self.destination_size <= (32 << 20)
+            && (!self.zlib() || self.intermediate_size > 0)
+    }
+
     fn check(&self, source_memory: bool) -> Result<(), HRESULT> {
         if self.memory_source() != source_memory || (self.source_physical_pages() && !self.memory_source()) {
             return Err(E_SOURCE_TYPE);
@@ -674,20 +735,24 @@ impl Request {
                     return Err(E_DESTINATION_SIZE);
                 }
             }
-            // Two-stage zlib -> BCPack: validate intermediate bounds when supplied, then refuse BCPack
-            // (counted and logged at enqueue, `BcpackRefusals`).
+            // Two-stage zlib -> BCPack: validate intermediate bounds; only BC1 may
+            // proceed when the experimental feature and runtime flag are enabled.
             (true, _) => {
                 if self.intermediate_size != 0 && (self.intermediate_size <= self.source_size || self.destination_size <= self.intermediate_size) {
                     return Err(E_DESTINATION_SIZE);
                 }
-                return Err(E_DECOMPRESSION);
+                if !bcpack_bc1_enabled() || !self.bcpack_bc1_shape() {
+                    return Err(E_DECOMPRESSION);
+                }
             }
-            // Single-stage BCPack: `intermediate_size` must be 0, then refuse BCPack.
+            // Single-stage BCPack: intermediate_size must be 0; only opt-in BC1 may proceed.
             (false, _) => {
                 if self.intermediate_size != 0 {
                     return Err(E_DESTINATION_SIZE);
                 }
-                return Err(E_DECOMPRESSION);
+                if !bcpack_bc1_enabled() || !self.bcpack_bc1_shape() {
+                    return Err(E_DECOMPRESSION);
+                }
             }
         }
         Ok(())
@@ -813,22 +878,38 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         b
     };
 
-    if r.swizzle() != 0 || r.bcpack() != 0 {
+    if r.swizzle() != 0 || (r.bcpack() != 0 && (!bcpack_bc1_enabled() || !r.bcpack_bc1_shape())) {
         return Err(E_DECOMPRESSION);
     }
 
-    let payload: Vec<u8> = if r.zlib() {
+    // The documented hardware order is zlib → BCPack → swizzle. Only a
+    // non-swizzled BC1 request is accepted by this experiment.
+    let mut intermediate: Vec<u8> = if r.zlib() {
         let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
-        let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
+        let d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
         if d.len() != stage1_len {
             return Err(E_ZLIB_DATA);
-        }
-        if d.len() < n {
-            d.resize(n, 0);
         }
         d
     } else {
         src
+    };
+    let payload: Vec<u8> = if r.bcpack() != 0 {
+        #[cfg(feature = "bcpack-bc1")]
+        {
+            decode_bcpack_bc1(&intermediate, n)?
+        }
+        #[cfg(not(feature = "bcpack-bc1"))]
+        {
+            return Err(E_DECOMPRESSION);
+        }
+    } else {
+        // Keep the original zlib-only behavior when the intermediate is
+        // shorter than the requested destination.
+        if intermediate.len() < n {
+            intermediate.resize(n, 0);
+        }
+        intermediate
     };
 
     if r.dest_physical_pages() {
@@ -1405,6 +1486,21 @@ mod tests {
         b[0x28..0x30].copy_from_slice(&offset.to_le_bytes());
         b[0x30..0x34].copy_from_slice(&src_size.to_le_bytes());
         b
+    }
+
+    #[test]
+    fn experimental_bc1_acceptance_requires_whole_blocks_and_no_swizzle() {
+        let b = request(1 << BCPACK_SHIFT, 0x1000, 8192, 0x2000, 0, 5000);
+        let r = Request::parse(&b);
+        assert!(r.bcpack_bc1_shape());
+        let partial = Request::parse(&request(1 << BCPACK_SHIFT, 0x1000, 8191, 0x2000, 0, 5000));
+        assert!(!partial.bcpack_bc1_shape());
+        let bc7 = Request::parse(&request(7 << BCPACK_SHIFT, 0x1000, 8192, 0x2000, 0, 5000));
+        assert!(!bc7.bcpack_bc1_shape());
+        let swizzled = Request::parse(&request((1 << BCPACK_SHIFT) | (1 << SWIZZLE_SHIFT), 0x1000, 8192, 0x2000, 0, 5000));
+        assert!(!swizzled.bcpack_bc1_shape());
+        let zlib_without_intermediate = Request::parse(&request((1 << BCPACK_SHIFT) | ZLIB_BIT, 0x1000, 8192, 0x2000, 0, 5000));
+        assert!(!zlib_without_intermediate.bcpack_bc1_shape());
     }
 
     #[test]
