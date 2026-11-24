@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "bcpack-rs"
+version = "0.2.0"
+source = "git+https://github.com/Ahmet-Dedeler/bcpack-rs?rev=c51ec521cbe6869136f29f5d157342374ef5cf33#c51ec521cbe6869136f29f5d157342374ef5cf33"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -547,6 +555,7 @@ checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
 name = "xcl"
 version = "0.1.0"
 dependencies = [
+ "bcpack-rs",
  "miniz_oxide",
  "retour",
  "serde",
