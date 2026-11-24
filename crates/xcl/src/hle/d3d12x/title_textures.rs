@@ -402,6 +402,8 @@ fn perf_report() {
             watch_gap_bytes() >> 10,
         );
     }
+    let (retained, peak) = super::pso_async::captured_memory();
+    crate::xlog_info!("XCL PERF deferred pipeline payload: {} MiB retained, {} MiB peak (owned descriptions only, not driver/other heap)", retained >> 20, peak >> 20);
     let (reused, created) = texture::wait_cache_counts();
     crate::xlog_info!("XCL PERF texture fence waits: {reused} reused, {created} newly allocated (bounded per-thread cache)");
     let (batches, textures, mib, fallbacks) = texture::coalescing_stats();
