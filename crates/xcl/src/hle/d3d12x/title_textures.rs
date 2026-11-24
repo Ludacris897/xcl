@@ -330,6 +330,9 @@ static PERF_REFRESH_US: AtomicU64 = AtomicU64::new(0);
 static PERF_WATCH_US: AtomicU64 = AtomicU64::new(0);
 static PERF_SELECT_US: AtomicU64 = AtomicU64::new(0);
 static PERF_DETILE_US: AtomicU64 = AtomicU64::new(0);
+static PERF_SOURCE_READ_US: AtomicU64 = AtomicU64::new(0);
+static PERF_TILING_ONLY_US: AtomicU64 = AtomicU64::new(0);
+static PERF_SOURCE_BYTES: AtomicU64 = AtomicU64::new(0);
 static PERF_GPU_BATCH_US: AtomicU64 = AtomicU64::new(0);
 static PERF_BATCHES: AtomicU64 = AtomicU64::new(0);
 static PERF_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -381,6 +384,12 @@ fn perf_report() {
         us(&PERF_GPU_BATCH_US),
         PERF_BATCHES.load(Ordering::Relaxed),
         PERF_BYTES.load(Ordering::Relaxed) >> 20
+    );
+    crate::xlog_info!(
+        "XCL PERF subresource details: source snapshot {} ms ({} MiB requested), CPU swizzle/detile {} ms; parent CPU-detile counter includes both and allocation overhead",
+        us(&PERF_SOURCE_READ_US),
+        PERF_SOURCE_BYTES.load(Ordering::Relaxed) >> 20,
+        us(&PERF_TILING_ONLY_US)
     );
     let watch_calls = PERF_WATCH_CALLS.load(Ordering::Relaxed);
     if watch_calls > 0 {
@@ -1186,20 +1195,42 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     let Some(tex) = tex.texels() else { return Vec::new() };
     let c = &tex.chain;
     let bpe = tex.bpe as usize;
+    let profile = perf_enabled();
     if tex.depth > 0 {
+        let t0 = profile.then(std::time::Instant::now);
         let mem = read_committed(va, tex.size() as usize);
-        return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(&mem, i) }).collect();
+        if let Some(t) = t0 {
+            perf_note(&PERF_SOURCE_READ_US, t.elapsed());
+            PERF_SOURCE_BYTES.fetch_add(mem.len() as u64, Ordering::Relaxed);
+        }
+        return c.levels.iter().enumerate().map(|(i, l)| {
+            let detile_t0 = profile.then(std::time::Instant::now);
+            let data = c.detile_volume(&mem, i);
+            if let Some(t) = detile_t0 {
+                perf_note(&PERF_TILING_ONLY_US, t.elapsed());
+            }
+            Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data }
+        }).collect();
     }
     let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
-    for s in 0..tex.array as usize {
-        let slice = read_committed(va + s * c.slice_bytes, c.slice_bytes);
+    for slice_index in 0..tex.array as usize {
+        let t0 = profile.then(std::time::Instant::now);
+        let slice = read_committed(va + slice_index * c.slice_bytes, c.slice_bytes);
+        if let Some(t) = t0 {
+            perf_note(&PERF_SOURCE_READ_US, t.elapsed());
+            PERF_SOURCE_BYTES.fetch_add(slice.len() as u64, Ordering::Relaxed);
+        }
         for (i, l) in c.levels.iter().enumerate() {
-            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(&slice, i, s) });
+            let detile_t0 = profile.then(std::time::Instant::now);
+            let data = c.detile_level(&slice, i, slice_index);
+            if let Some(t) = detile_t0 {
+                perf_note(&PERF_TILING_ONLY_US, t.elapsed());
+            }
+            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data });
         }
     }
     out
 }
-
 
 #[cfg(test)]
 mod tests {
