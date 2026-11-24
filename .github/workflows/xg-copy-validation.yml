@@ -1,0 +1,32 @@
+name: XCL streaming and pipeline regression (Windows)
+
+on:
+  push:
+    branches:
+      - experiment/xg-copy-validation-20261123
+  pull_request:
+    paths:
+      - 'crates/xcl/src/hle/xg.rs'
+      - 'crates/xcl/src/hle/d3d12x/pso_async.rs'
+      - 'crates/xcl/src/hle/d3d12x/title_textures.rs'
+      - 'crates/xcl/src/gpu/tiling.rs'
+      - 'tools/analyze-xcl-perf.py'
+      - 'tools/test-analyze-xcl-perf.py'
+      - '.github/workflows/xg-copy-validation.yml'
+  workflow_dispatch:
+
+jobs:
+  regressions:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify Windows compilation
+        run: cargo check -p xcl --lib --locked
+      - name: XG texture copy and memory tests
+        run: cargo test -p xcl --lib xg::tests:: --locked -- --test-threads=1
+      - name: Async pipeline lifecycle tests
+        run: cargo test -p xcl --lib pso_async::tests:: --locked -- --test-threads=1
+      - name: Performance log parser tests
+        run: python tools/test-analyze-xcl-perf.py

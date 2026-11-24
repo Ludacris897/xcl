@@ -8,8 +8,8 @@
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, RwLock};
 
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
@@ -22,11 +22,22 @@ struct Pending {
     cv: Condvar,
     compute: bool,
     /// the stand-in was released before the real pipeline was built
-    orphan: std::sync::atomic::AtomicBool,
+    orphan: AtomicBool,
+    /// Counted in IN_FLIGHT while this stand-in is live and unfinished.
+    tracked: AtomicBool,
 }
 
 /// stand-in handed to the title → its real pipeline
-static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
+static PENDING: RwLock<Option<HashMap<usize, Arc<Pending>>>> = RwLock::new(None);
+/// Number of still-live stand-ins whose jobs have not completed. Unlike scanning
+/// every job and locking its Condvar state, this is O(1) on activity/report paths.
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+fn stop_tracking(p: &Pending) {
+    if p.tracked.swap(false, Ordering::AcqRel) {
+        IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// The build is done (`real`: its pipeline, 0 = failed).
 fn complete(p: &Pending, real: usize) {
@@ -42,6 +53,7 @@ fn complete(p: &Pending, real: usize) {
             p.real.store(real, Ordering::Release);
         }
         *done = true;
+        stop_tracking(p);
         p.cv.notify_all();
         orphan
     };
@@ -113,14 +125,25 @@ pub fn submit_lazy(standin: usize, compute: bool, job: Job) {
 fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
-        sent: std::sync::atomic::AtomicBool::new(send),
+        sent: AtomicBool::new(send),
         real: AtomicUsize::new(0),
         done: Mutex::new(false),
         cv: Condvar::new(),
         compute,
         orphan: Default::default(),
+        tracked: AtomicBool::new(true),
     });
-    PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
+    {
+        let mut state = PENDING.write().unwrap();
+        let map = state.get_or_insert_with(HashMap::new);
+        // An address should not be reused before Release; avoid a leaked counter if
+        // a title nonetheless submits the same stand-in address twice.
+        if let Some(replaced) = map.insert(standin, p.clone()) {
+            replaced.orphan.store(true, Ordering::Release);
+            stop_tracking(&replaced);
+        }
+        IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+    }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
@@ -131,17 +154,15 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
-    PENDING.lock().unwrap().as_ref()?.get(&pso).cloned()
+    PENDING.read().unwrap().as_ref()?.get(&pso).cloned()
 }
 
-/// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
-pub fn resolve(pso: usize) -> usize {
-    let Some(p) = entry(pso) else { return pso };
+/// Resolve a previously looked-up pipeline without reacquiring the global map lock.
+fn resolve_entry(pso: usize, p: &Arc<Pending>) -> usize {
     match p.real.load(Ordering::Acquire) {
         0 => {
-            // a lazy one is wanted now: to the workers
             if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue().lock().unwrap().send(p);
+                let _ = queue().lock().unwrap().send(Arc::clone(p));
             }
             pso
         }
@@ -149,13 +170,12 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
-/// `resolve`, waiting for a pipeline still being built – built here if no worker has started
-/// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
-pub fn resolve_wait(pso: usize) -> usize {
-    let Some(p) = entry(pso) else { return pso };
+/// Resolve a compute pipeline, compiling it on the calling thread if its lazy
+/// job has not started, then waiting for completion if a worker claimed it.
+fn resolve_wait_entry(pso: usize, p: &Arc<Pending>) -> usize {
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
-        complete(&p, job());
+        complete(p, job());
     }
     let mut done = p.done.lock().unwrap();
     while !*done {
@@ -167,12 +187,27 @@ pub fn resolve_wait(pso: usize) -> usize {
     }
 }
 
+/// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
+pub fn resolve(pso: usize) -> usize {
+    let Some(p) = entry(pso) else { return pso };
+    resolve_entry(pso, &p)
+}
+
+/// `resolve`, waiting for a pipeline still being built.
+pub fn resolve_wait(pso: usize) -> usize {
+    let Some(p) = entry(pso) else { return pso };
+    resolve_wait_entry(pso, &p)
+}
+
 /// For binding: compute pipelines are waited for, graphics ones are not.
+/// Reuse the same lookup – this previously locked and searched PENDING twice
+/// on every bind, including on the render thread's fast path.
 pub fn resolve_for_bind(pso: usize) -> usize {
-    match entry(pso) {
-        Some(p) if p.compute => resolve_wait(pso),
-        Some(_) => resolve(pso),
-        None => pso,
+    let Some(p) = entry(pso) else { return pso };
+    if p.compute {
+        resolve_wait_entry(pso, &p)
+    } else {
+        resolve_entry(pso, &p)
     }
 }
 
@@ -180,12 +215,13 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 /// another object) and return its real pipeline to release (0: none, or still being built –
 /// the worker's result is then released when it arrives).
 pub fn released(pso: usize) -> usize {
-    let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
+    let Some(p) = PENDING.write().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
     let done = p.done.lock().unwrap();
+    stop_tracking(&p);
     if *done {
         p.real.swap(0, Ordering::AcqRel)
     } else {
-        // the worker stores its result into a Pending nobody will read: mark it orphaned
+        // The worker must discard its result if the title releases the stand-in first.
         p.orphan.store(true, Ordering::Release);
         0
     }
@@ -198,6 +234,35 @@ pub fn is_pending(pso: usize) -> bool {
 
 /// (built in the background, failed, still building)
 pub fn counts() -> (usize, usize, usize) {
-    let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
-    (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+    (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), IN_FLIGHT.load(Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lazy_compute_job_resolves_and_retires_without_worker() {
+        // No real D3D12 pipeline is created. A zero result stays the stand-in.
+        let standin = usize::MAX - 0x1000;
+        let before = counts().2;
+        submit_lazy(standin, true, Box::new(|| 0));
+        assert!(is_pending(standin));
+        assert_eq!(counts().2, before + 1);
+        assert_eq!(resolve_for_bind(standin), standin);
+        assert!(!is_pending(standin));
+        assert_eq!(counts().2, before);
+        assert_eq!(released(standin), 0);
+        assert_eq!(counts().2, before);
+    }
+
+    #[test]
+    fn released_lazy_job_does_not_remain_counted() {
+        let standin = usize::MAX - 0x2000;
+        let before = counts().2;
+        submit_lazy(standin, false, Box::new(|| 0));
+        assert_eq!(counts().2, before + 1);
+        assert_eq!(released(standin), 0);
+        assert_eq!(counts().2, before);
+    }
 }

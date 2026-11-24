@@ -317,6 +317,84 @@ static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> =
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
 
+/// Optional profiling of the synchronous world-streaming hot path. Cumulative durations
+/// are microseconds. XCL_PERF=1 records timings but leaves the rendering policy unchanged.
+fn perf_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_PERF").is_ok_and(|v| !v.is_empty() && v != "0"))
+}
+
+static PERF_REFRESH: AtomicU64 = AtomicU64::new(0);
+static PERF_LOCK_US: AtomicU64 = AtomicU64::new(0);
+static PERF_REFRESH_US: AtomicU64 = AtomicU64::new(0);
+static PERF_WATCH_US: AtomicU64 = AtomicU64::new(0);
+static PERF_SELECT_US: AtomicU64 = AtomicU64::new(0);
+static PERF_DETILE_US: AtomicU64 = AtomicU64::new(0);
+static PERF_GPU_BATCH_US: AtomicU64 = AtomicU64::new(0);
+static PERF_BATCHES: AtomicU64 = AtomicU64::new(0);
+static PERF_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Write-watch is currently a major measured streaming cost. These counters help
+/// determine whether a few huge regions or thousands of tiny calls dominate.
+static PERF_WATCH_CALLS: AtomicU64 = AtomicU64::new(0);
+static PERF_WATCH_BYTES: AtomicU64 = AtomicU64::new(0);
+static PERF_WATCH_MAX_US: AtomicU64 = AtomicU64::new(0);
+static PERF_WATCH_MAX_BYTES: AtomicU64 = AtomicU64::new(0);
+static PERF_WATCH_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+fn perf_watch_call(bytes: usize, elapsed: std::time::Duration, result: u32) {
+    if !perf_enabled() {
+        return;
+    }
+    PERF_WATCH_CALLS.fetch_add(1, Ordering::Relaxed);
+    PERF_WATCH_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    if result != 0 {
+        PERF_WATCH_ERRORS.fetch_add(1, Ordering::Relaxed);
+    }
+    let us = elapsed.as_micros() as u64;
+    if us > PERF_WATCH_MAX_US.fetch_max(us, Ordering::Relaxed) {
+        PERF_WATCH_MAX_BYTES.store(bytes as u64, Ordering::Relaxed);
+    }
+}
+
+fn perf_note(counter: &AtomicU64, duration: std::time::Duration) {
+    if perf_enabled() {
+        counter.fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+fn perf_report() {
+    if !perf_enabled() {
+        return;
+    }
+    let n = PERF_REFRESH.fetch_add(1, Ordering::Relaxed) + 1;
+    if n < 64 || !n.is_power_of_two() {
+        return;
+    }
+    let us = |a: &AtomicU64| a.load(Ordering::Relaxed) / 1000;
+    crate::xlog_info!(
+        "XCL PERF texture refresh: {n} calls, {} ms total, lock {} ms, write-watch {} ms, texture selection {} ms, CPU detile {} ms, GPU batch+wait {} ms ({} batches, {} MiB staged)",
+        us(&PERF_REFRESH_US),
+        us(&PERF_LOCK_US),
+        us(&PERF_WATCH_US),
+        us(&PERF_SELECT_US),
+        us(&PERF_DETILE_US),
+        us(&PERF_GPU_BATCH_US),
+        PERF_BATCHES.load(Ordering::Relaxed),
+        PERF_BYTES.load(Ordering::Relaxed) >> 20
+    );
+    let watch_calls = PERF_WATCH_CALLS.load(Ordering::Relaxed);
+    if watch_calls > 0 {
+        crate::xlog_info!(
+            "XCL PERF GetWriteWatch: {watch_calls} calls, {} GiB of ranges scanned cumulatively, slowest call {} us ({} KiB region), {} failed calls, gap merge threshold {} KiB",
+            PERF_WATCH_BYTES.load(Ordering::Relaxed) >> 30,
+            PERF_WATCH_MAX_US.load(Ordering::Relaxed),
+            PERF_WATCH_MAX_BYTES.load(Ordering::Relaxed) >> 10,
+            PERF_WATCH_ERRORS.load(Ordering::Relaxed),
+            watch_gap_bytes() >> 10,
+        );
+    }
+}
+
 /// Number of textures kept in title memory and uploads done so far.
 pub fn counts() -> (usize, u64) {
     (TEXTURES.lock().unwrap().by_res.len(), UPLOADS.load(Ordering::Relaxed))
@@ -656,8 +734,16 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
     if BUSY.with(|b| b.get()) {
         return;
     }
+    let t0 = perf_enabled().then(std::time::Instant::now);
     let _refresh = REFRESH.lock().unwrap();
+    if let Some(t) = t0 {
+        perf_note(&PERF_LOCK_US, t.elapsed());
+    }
     own_work(|| refresh_once(queue));
+    if let Some(t) = t0 {
+        perf_note(&PERF_REFRESH_US, t.elapsed());
+    }
+    perf_report();
 }
 
 unsafe fn refresh_once(queue: *mut c_void) {
@@ -681,7 +767,24 @@ unsafe fn refresh_once(queue: *mut c_void) {
             for &(base, size) in ranges.iter() {
                 loop {
                     let mut n = buf.len();
-                    if GetWriteWatch(WRITE_WATCH_FLAG_RESET, base as *const c_void, size, buf.as_mut_ptr(), &mut n, &mut page) != 0 {
+                    let call_t0 = perf_enabled().then(std::time::Instant::now);
+                    let result = GetWriteWatch(WRITE_WATCH_FLAG_RESET, base as *const c_void, size, buf.as_mut_ptr(), &mut n, &mut page);
+                    if let Some(t) = call_t0 {
+                        perf_watch_call(size, t.elapsed(), result);
+                    }
+                    if result != 0 {
+                        // A failed write-watch query must not disappear silently:
+                        // dirty pages from this range have not been collected.
+                        static WATCH_WARNINGS: AtomicU64 = AtomicU64::new(0);
+                        let k = WATCH_WARNINGS.fetch_add(1, Ordering::Relaxed) + 1;
+                        if k <= 8 || k.is_power_of_two() {
+                            crate::xlog_warn!(
+                                "GetWriteWatch failed #{k}: code {result} for {base:#x}..{:#x} ({} KiB, {} output slots); dirty texture updates may be missed",
+                                base.saturating_add(size),
+                                size >> 10,
+                                buf.len(),
+                            );
+                        }
                         break;
                     }
                     dirty.extend(buf[..n].iter().map(|&p| p as usize));
@@ -695,6 +798,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    perf_note(&PERF_WATCH_US, watch_t0.elapsed());
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)
@@ -737,6 +841,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
+    let select_t0 = perf_enabled().then(std::time::Instant::now);
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
@@ -762,13 +867,35 @@ unsafe fn refresh_once(queue: *mut c_void) {
             })
             .collect()
     });
+    if let Some(t) = select_t0 {
+        perf_note(&PERF_SELECT_US, t.elapsed());
+    }
     upload_all(todo);
 }
 
-/// staging bytes of one batch at most
+/// Default staging budget per upload batch. One list and GPU completion wait
+/// per batch; bigger batches reduce waits but increase transient upload-heap usage.
 const BATCH_BYTES: usize = 256 << 20;
 
-/// The uploads `todo`, in batches of up to `BATCH_BYTES` (one list and one wait each).
+/// XCL_TEXTURE_BATCH_MIB=16..512 permits a controlled batch-size experiment.
+/// Invalid values preserve the existing 256 MiB default.
+fn batch_size_from_env(raw: &str) -> Option<usize> {
+    raw.trim().parse::<usize>().ok().filter(|&mib| (16..=512).contains(&mib)).map(|mib| mib << 20)
+}
+
+fn texture_batch_bytes() -> usize {
+    static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BATCH.get_or_init(|| {
+        let bytes = std::env::var("XCL_TEXTURE_BATCH_MIB").ok()
+            .as_deref().and_then(batch_size_from_env).unwrap_or(BATCH_BYTES);
+        if perf_enabled() {
+            crate::xlog_info!("XCL PERF texture upload batch budget: {} MiB", bytes >> 20);
+        }
+        bytes
+    })
+}
+
+/// The uploads `todo`, in batches of up to `texture_batch_bytes()` (one list and one wait each).
 unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
@@ -776,19 +903,25 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             crate::xlog_warn!("title texture: upload failed: {e}");
         }
     };
+    let max_batch_bytes = texture_batch_bytes();
     let mut todo = todo.into_iter().peekable();
     while todo.peek().is_some() {
         let mut batch = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
         while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            if !batch.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
+            if !batch.is_empty() && (bytes.saturating_add(tex.size() as usize) > max_batch_bytes || *dev != device) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
             device = dev;
             bytes += tex.size() as usize;
+            let detile_t0 = perf_enabled().then(std::time::Instant::now);
             let subs = subresources(va, &tex);
+            if let Some(t) = detile_t0 {
+                perf_note(&PERF_DETILE_US, t.elapsed());
+                PERF_BYTES.fetch_add(subs.iter().map(|s| s.data.len() as u64).sum::<u64>(), Ordering::Relaxed);
+            }
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
@@ -803,10 +936,16 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 continue;
             }
         };
-        match own_work(|| {
+        let gpu_t0 = perf_enabled().then(std::time::Instant::now);
+        let upload_result = own_work(|| {
             super::vram::before_execute(&queue);
             texture::upload_batch(dev, &queue, &batch)
-        }) {
+        });
+        if let Some(t) = gpu_t0 {
+            perf_note(&PERF_GPU_BATCH_US, t.elapsed());
+            PERF_BATCHES.fetch_add(1, Ordering::Relaxed);
+        }
+        match upload_result {
             Ok(failed) => {
                 for (_, e) in failed {
                     warn(&e);
@@ -938,19 +1077,35 @@ unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12Comman
     Ok(made)
 }
 
-/// Ranges closer than this are scanned as one (a gap costs little to scan; a call per texture –
-/// thousands of them – a lot)
+/// Default gap between ranges merged into a single GetWriteWatch call. A large gap
+/// amortizes system calls; a smaller gap avoids scanning unwatched pages. Neither
+/// setting skips tracked texture pages, so the experiment is correctness-preserving.
 const WATCH_GAP: usize = 1 << 20;
 
+/// XCL_WATCH_GAP_KIB=0..4096. Keep the original 1024 KiB default.
+fn watch_gap_from_env(raw: &str) -> Option<usize> {
+    raw.trim().parse::<usize>().ok().filter(|&kib| kib <= 4096).and_then(|kib| kib.checked_mul(1024))
+}
+
+fn watch_gap_bytes() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| std::env::var("XCL_WATCH_GAP_KIB").ok().as_deref()
+        .and_then(watch_gap_from_env).unwrap_or(WATCH_GAP))
+}
+
 /// The parts of `wanted` (start, end) inside `regions` (base, size), merged (gaps under
-/// `WATCH_GAP` too) and sorted, as (base, size) – each within one region (a write-watch call
-/// covers one allocation).
-fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+/// the configured threshold too) and sorted, as (base, size) – each within one region.
+fn watch_ranges(regions: &[(usize, usize)], wanted: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    watch_ranges_with_gap(regions, wanted, watch_gap_bytes())
+}
+
+/// Pure deterministic implementation for testing both aggressive and conservative merging.
+fn watch_ranges_with_gap(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
     wanted.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (a, b) in wanted {
         match merged.last_mut() {
-            Some(last) if a <= last.1.saturating_add(WATCH_GAP) => last.1 = last.1.max(b),
+            Some(last) if a <= last.1.saturating_add(gap) => last.1 = last.1.max(b),
             _ => merged.push((a, b)),
         }
     }
@@ -1043,6 +1198,16 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configurable_upload_batch_preserves_default_and_bounds() {
+        assert_eq!(batch_size_from_env("256"), Some(256 << 20));
+        assert_eq!(batch_size_from_env("16"), Some(16 << 20));
+        assert_eq!(batch_size_from_env("512"), Some(512 << 20));
+        assert_eq!(batch_size_from_env("0"), None);
+        assert_eq!(batch_size_from_env("2048"), None);
+        assert_eq!(batch_size_from_env("not-a-number"), None);
+    }
 
     /// Real uploads, dirty-page detection and a source changing after registration:
     /// bookkeeping alone cannot show that the bytes the GPU sees follow the mirror.
@@ -1318,6 +1483,22 @@ mod tests {
         // ranges a gap of under 1 MiB apart: one scan; further apart: two
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000)]);
+    }
+
+    #[test]
+    fn write_watch_gap_keeps_all_wanted_pages() {
+        let regions = [(0x1000_0000, 0x20_0000)];
+        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000)];
+        let exact = watch_ranges_with_gap(&regions, wanted.clone(), 0);
+        assert_eq!(exact, vec![(0x1000_0000, 0x1000), (0x1008_0000, 0x1000)]);
+        let merged = watch_ranges_with_gap(&regions, wanted, WATCH_GAP);
+        assert_eq!(merged, vec![(0x1000_0000, 0x8_1000)]);
+        assert_eq!(watch_gap_from_env("0"), Some(0));
+        assert_eq!(watch_gap_from_env("64"), Some(65536));
+        assert_eq!(watch_gap_from_env("1024"), Some(WATCH_GAP));
+        assert_eq!(watch_gap_from_env("4096"), Some(4096 << 10));
+        assert_eq!(watch_gap_from_env("4097"), None);
+        assert_eq!(watch_gap_from_env("-1"), None);
     }
 
     fn console_desc(dim: u32, w: u64, h: u32, array_or_depth: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {
