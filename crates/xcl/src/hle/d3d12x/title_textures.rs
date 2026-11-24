@@ -324,6 +324,8 @@ pub fn counts() -> (usize, u64) {
 
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
+    // (a new texture object, or the address of an old one again: its first upload is not left out)
+    LAST_CONTENT.lock().unwrap().remove(&(res as usize));
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
     // the console's 32-bit 116 / 117 floats are half floats on the PC (`pc_resource_desc`): the
     // title's bytes are not the resource's texels
@@ -495,6 +497,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
 
 /// The PC texture was released for good.
 pub fn forget(res: usize) {
+    LAST_CONTENT.lock().unwrap().remove(&res);
     let (removed, to_remap) = {
         let mut t = TEXTURES.lock().unwrap();
         let (removed, delta, remap_ptrs) = t.remove(res);
@@ -765,6 +768,49 @@ unsafe fn refresh_once(queue: *mut c_void) {
     upload_all(todo);
 }
 
+/// texture → `content_hash` of its memory at its last upload
+static LAST_CONTENT: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+static UNCHANGED: AtomicU64 = AtomicU64::new(0);
+
+/// `XCL_TEXTURE_SKIP_UNCHANGED=0` uploads a texture whenever its pages were written, as before.
+fn unchanged_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TEXTURE_SKIP_UNCHANGED").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Compare against the last *successful* upload, without modifying the cache.
+fn same_as_last_upload(res: usize, h: u64) -> bool {
+    LAST_CONTENT.lock().unwrap().get(&res).copied() == Some(h)
+}
+
+/// Invalidate an unsuccessful upload; never advertise its bytes as GPU contents.
+fn finish_upload_hash(res: usize, hash: Option<u64>, success: bool) {
+    let mut cache = LAST_CONTENT.lock().unwrap();
+    match (hash, success) {
+        (Some(h), true) => { cache.insert(res, h); }
+        _ => { cache.remove(&res); }
+    }
+}
+
+/// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
+/// 8-byte words: gigabytes a second; not for anything adversarial).
+fn content_hash(b: &[u8]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = [K, K.rotate_left(17), K.rotate_left(31), K.rotate_left(47)];
+    let mut chunks = b.chunks_exact(32);
+    for c in &mut chunks {
+        for (k, lane) in h.iter_mut().enumerate() {
+            let v = u64::from_le_bytes(c[k * 8..k * 8 + 8].try_into().unwrap());
+            *lane = (*lane ^ v).wrapping_mul(K).rotate_left(29);
+        }
+    }
+    let mut tail = b.len() as u64;
+    for (k, &x) in chunks.remainder().iter().enumerate() {
+        tail = (tail ^ ((x as u64) << (8 * (k % 8)))).wrapping_mul(K).rotate_left(23);
+    }
+    h.iter().fold(tail, |a, &l| (a ^ l).wrapping_mul(K).rotate_left(27))
+}
+
 /// staging bytes of one batch at most
 const BATCH_BYTES: usize = 256 << 20;
 
@@ -778,27 +824,57 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
     };
     let mut todo = todo.into_iter().peekable();
     while todo.peek().is_some() {
-        let mut batch = Vec::new();
+        let mut picked = Vec::new();
+        let mut hashes = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
         while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            if !batch.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
+            if !picked.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
+            // The same bytes as at this texture's last upload: nothing to do. The write watch is
+            // per page and a title writes next to its textures (and rewrites what it wrote): a
+            // retail title's video planes and UI targets went up again for every submit, ~25 MB
+            // a presented frame where ~3 MB had changed, and the submits waited here.
+            let hash = unchanged_skip().then(|| content_hash(&title_bytes(va, tex.size() as usize)));
+            if let Some(h) = hash {
+                if same_as_last_upload(r.as_raw() as usize, h) {
+                    let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || (n.is_power_of_two() && n >= 1024) {
+                        crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
+                    }
+                    continue;
+                }
+            }
             device = dev;
             bytes += tex.size() as usize;
-            let subs = subresources(va, &tex);
+            hashes.push(hash);
+            picked.push((r, va, tex, states));
+        }
+        if picked.is_empty() { continue; }
+        let subs = subresources_of_all(&picked, bytes);
+        let mut batch = Vec::with_capacity(picked.len());
+        for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
             batch.push((r, subs, states));
         }
         let d = device as *mut c_void;
-        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
+        let invalidate = || {
+            for (r, _, _) in &batch {
+                finish_upload_hash(r.as_raw() as usize, None, false);
+            }
+        };
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else {
+            invalidate();
+            continue;
+        };
         let queue = match upload_queue(dev, device) {
             Ok(q) => q,
             Err(e) => {
+                invalidate();
                 warn(&e);
                 continue;
             }
@@ -808,12 +884,20 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             texture::upload_batch(dev, &queue, &batch)
         }) {
             Ok(failed) => {
-                for (_, e) in failed {
+                let mut successful = vec![true; batch.len()];
+                for (i, e) in failed {
+                    if let Some(ok) = successful.get_mut(i) { *ok = false; }
                     warn(&e);
                 }
-                UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                for (i, (r, _, _)) in batch.iter().enumerate() {
+                    finish_upload_hash(r.as_raw() as usize, hashes[i], successful[i]);
+                }
+                UPLOADS.fetch_add(successful.iter().filter(|&&ok| ok).count() as u64, Ordering::Relaxed);
             }
-            Err(e) => warn(&e),
+            Err(e) => {
+                invalidate();
+                warn(&e);
+            }
         }
     }
 }
@@ -972,26 +1056,107 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
 unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut out = vec![0u8; len];
-    // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
-    // walking it)
+    let Some(limit) = at.checked_add(len) else { return out };
+    if len == 0 { return out; }
+    // XCL owns the coherent window and commits it for the lifetime of the title.
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
         return out;
     }
+    // Most title allocations are fully readable. One guarded read avoids the
+    // VirtualQuery region walk and cannot fault a detile worker on a decommit race.
+    if read_title_range(at, &mut out) { return out; }
+    out.fill(0);
     let mut p = at;
-    while p < at + len {
+    while p < limit {
         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
         if VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 {
             break;
         }
-        let end = (m.BaseAddress as usize + m.RegionSize).min(at + len);
-        let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0; // R / RW / WC / X-R…, no guard
+        let end = (m.BaseAddress as usize).saturating_add(m.RegionSize).min(limit);
+        if end <= p { break; }
+        let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0;
         if readable {
-            std::ptr::copy_nonoverlapping(p as *const u8, out.as_mut_ptr().add(p - at), end - p);
+            let target = &mut out[p - at..end - at];
+            if !read_title_range(p, target) {
+                // A region may have changed after VirtualQuery. Preserve the
+                // readable portions, and leave pages that disappeared as zeros.
+                let mut q = p;
+                while q < end {
+                    let next = (q | 0xfff).saturating_add(1).min(end);
+                    if next <= q { break; }
+                    let page = &mut out[q - at..next - at];
+                    if !read_title_range(q, page) { page.fill(0); }
+                    q = next;
+                }
+            }
         }
         p = end;
     }
     out
+}
+
+/// Guarded self-process snapshot. On failure the caller must discard partial bytes.
+unsafe fn read_title_range(at: usize, out: &mut [u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut read = 0usize;
+    ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out.as_mut_ptr().cast(), out.len(), &mut read) != 0 && read == out.len()
+}
+
+/// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
+const PARALLEL_BYTES: usize = 1 << 20;
+
+/// `subresources` of every texture of a batch (`bytes` of them), in order: on several threads
+/// when the batch is big. They were read and detiled one after another in the title's own
+/// submit – most of a retail game's render thread while it streamed textures the CPU writes.
+unsafe fn subresources_of_all(picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>)], bytes: usize) -> Vec<Vec<Subresource>> {
+    let picked: Vec<(usize, &xg::Texture)> = picked.iter().map(|(_, va, tex, _)| (*va, &**tex)).collect();
+    let threads = if bytes < PARALLEL_BYTES { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8) };
+    subresources_on(&picked, threads)
+}
+
+/// `subresources` of each (address, texture), in order, on up to `threads` threads.
+unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> Vec<Vec<Subresource>> {
+    let threads = threads.min(picked.len());
+    if threads <= 1 {
+        return picked.iter().map(|&(va, tex)| subresources(va, tex)).collect();
+    }
+    // the next texture to take; each thread hands back (index, subresources)
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut out: Vec<Vec<Subresource>> = (0..picked.len()).map(|_| Vec::new()).collect();
+    let done: Vec<Vec<(usize, Vec<Subresource>)>> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(va, tex)) = picked.get(k) else { break };
+                        // SAFETY: as in the serial path – the title's memory is only read
+                        mine.push((k, unsafe { subresources(va, tex) }));
+                    }
+                    mine
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap_or_default()).collect()
+    });
+    for (k, subs) in done.into_iter().flatten() {
+        out[k] = subs;
+    }
+    out
+}
+
+/// Borrow only the XCL-owned, fully committed coherent window. A readable
+/// title-owned mapping can be decommitted immediately after a readability
+/// check; use a guarded snapshot there, including for hashing and parallel detiling.
+unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
+        std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
+    } else {
+        std::borrow::Cow::Owned(read_committed(at, len))
+    }
 }
 
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
@@ -1000,12 +1165,12 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     let c = &tex.chain;
     let bpe = tex.bpe as usize;
     if tex.depth > 0 {
-        let mem = read_committed(va, tex.size() as usize);
+        let mem = title_bytes(va, tex.size() as usize);
         return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(&mem, i) }).collect();
     }
     let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
     for s in 0..tex.array as usize {
-        let slice = read_committed(va + s * c.slice_bytes, c.slice_bytes);
+        let slice = title_bytes(va + s * c.slice_bytes, c.slice_bytes);
         for (i, l) in c.levels.iter().enumerate() {
             out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(&slice, i, s) });
         }
@@ -1017,6 +1182,41 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A texture is left out only when its memory hashes as at its own last upload, and a
+    /// texture that was forgotten (released, or its address registered again) is uploaded again.
+    #[test]
+    fn a_texture_with_unchanged_memory_is_left_out_until_it_is_forgotten() {
+        let (a, b) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize);
+        let mut mem = vec![0u8; 3 << 20];
+        mem[5] = 1;
+        let h = content_hash(&mem);
+        assert!(!same_as_last_upload(a, h), "the first upload is not left out");
+        assert!(!same_as_last_upload(a, h), "lookup alone never commits a hash");
+        finish_upload_hash(a, Some(h), true);
+        assert!(same_as_last_upload(a, h), "the same bytes again: left out");
+        assert!(!same_as_last_upload(b, h), "another texture over the same bytes has its own first upload");
+        // one byte anywhere, also in the tail that is not a whole 32-byte step
+        for at in [0usize, 31, 32, (3 << 20) - 1] {
+            let mut m = mem.clone();
+            m[at] ^= 0x80;
+            assert_ne!(content_hash(&m), h, "byte {at} changed");
+        }
+        mem[(3 << 20) - 1] = 9;
+        let h2 = content_hash(&mem);
+        assert!(!same_as_last_upload(a, h2), "changed memory is uploaded");
+        finish_upload_hash(a, Some(h2), false);
+        assert!(!same_as_last_upload(a, h2), "failed upload must not be skipped");
+        assert!(!same_as_last_upload(a, h), "old content is uncertain after a failed copy");
+        finish_upload_hash(a, Some(h2), true);
+        assert!(same_as_last_upload(a, h2));
+        // the length is part of the content: a prefix of zeros is not the whole
+        assert_ne!(content_hash(&[0u8; 64]), content_hash(&[0u8; 96]));
+        forget(a);
+        assert!(!same_as_last_upload(a, h2), "forgotten: its next upload is a first one");
+        forget(a);
+        forget(b);
+    }
 
     /// Real uploads, dirty-page detection and a source changing after registration:
     /// bookkeeping alone cannot show that the bytes the GPU sees follow the mirror.
@@ -1283,6 +1483,34 @@ mod tests {
         assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
     }
 
+    /// The title's bytes are used where they are when all of them are readable, and read with the
+    /// pages that are not committed as zeros otherwise – the same bytes either way.
+    #[test]
+    fn title_bytes_snapshot_readable_and_sparse_title_memory() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 << 12, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            for page in [0usize, 2] {
+                VirtualAlloc((base + (page << 12)) as *const c_void, 1 << 12, MEM_COMMIT, PAGE_READWRITE);
+                std::ptr::write_bytes((base + (page << 12)) as *mut u8, 0xA0 + page as u8, 1 << 12);
+            }
+            let whole = title_bytes(base, 1 << 12);
+            assert!(matches!(whole, std::borrow::Cow::Owned(_)), "title-owned pages must be snapshotted");
+            assert_ne!(whole.as_ptr() as usize, base);
+            assert!(whole.iter().all(|&b| b == 0xA0));
+            let holed = title_bytes(base, 3 << 12);
+            assert!(matches!(holed, std::borrow::Cow::Owned(_)), "a range with a reserved page is read");
+            assert_eq!(&holed[..], &read_committed(base, 3 << 12)[..]);
+            assert!(holed[..1 << 12].iter().all(|&b| b == 0xA0) && holed[1 << 12..2 << 12].iter().all(|&b| b == 0) && holed[2 << 12..].iter().all(|&b| b == 0xA2));
+            assert_ne!(VirtualFree(base as *mut c_void, 1 << 12, windows_sys::Win32::System::Memory::MEM_DECOMMIT), 0);
+            assert!(whole.iter().all(|&b| b == 0xA0), "snapshot survives later decommit");
+            let missing = title_bytes(base, 1 << 12);
+            assert!(missing.iter().all(|&b| b == 0), "decommitted page reads as zero");
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
     /// Only the wanted parts of the watched regions are scanned, merged, one region each.
     #[test]
     fn watch_ranges_clip_and_merge() {
@@ -1292,6 +1520,32 @@ mod tests {
         // ranges a gap of under 1 MiB apart: one scan; further apart: two
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000)]);
+    }
+
+    /// The textures of a batch detiled on several threads come back as on one: complete and in
+    /// order (2D with mips and slices, 3D, BC7, a tiny one; more textures than threads).
+    #[test]
+    fn a_batch_detiled_on_several_threads_matches_one_thread() {
+        let descs = [
+            console_desc(3, 64, 64, 2, 3, 28, 0x105),
+            console_desc(3, 200, 72, 1, 5, 28, 0x105),
+            console_desc(4, 40, 24, 6, 3, 28, 0x105),
+            console_desc(3, 256, 256, 1, 9, 98, 0x10A),
+            console_desc(3, 4, 4, 1, 1, 28, 0x105),
+            console_desc(3, 128, 32, 3, 2, 28, 0x105),
+            console_desc(3, 64, 64, 1, 1, 28, 0x105),
+        ];
+        let textures: Vec<xg::Texture> = descs.iter().map(|d| xg::Texture::new(d).unwrap()).collect();
+        // each texture's console memory: distinct bytes per texture
+        let mems: Vec<Vec<u8>> = textures.iter().enumerate().map(|(t, x)| (0..x.size() as usize).map(|i| (i * 7 + t * 61) as u8).collect()).collect();
+        let picked: Vec<(usize, &xg::Texture)> = mems.iter().zip(&textures).map(|(m, x)| (m.as_ptr() as usize, x)).collect();
+        unsafe {
+            let one = subresources_on(&picked, 1);
+            assert!(one.iter().all(|s| !s.is_empty()), "a texture gave no subresources");
+            for threads in [2, 3, 8] {
+                assert!(subresources_on(&picked, threads) == one, "{threads} threads differ from one");
+            }
+        }
     }
 
     fn console_desc(dim: u32, w: u64, h: u32, array_or_depth: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {

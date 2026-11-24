@@ -11,12 +11,12 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{mpsc, Mutex};
 
 use windows::core::Interface;
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows_sys::Win32::System::Threading as th;
+use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::System::Threading::CreateEventW;
 
 /// A bottom-of-pipe write into memory outside unified memory, applied by the CPU once the
 /// queue's fence reaches the submission that recorded it.
@@ -31,6 +31,7 @@ pub(super) enum Write {
 }
 
 struct Job {
+    device: ID3D12Device,
     fence: ID3D12Fence,
     value: u64,
     writes: Vec<Write>,
@@ -41,44 +42,65 @@ unsafe impl Send for Job {}
 
 /// queue → its fence and the last value signalled
 struct QueueFence {
+    device: ID3D12Device,
     fence: ID3D12Fence,
     value: u64,
+    sender: mpsc::Sender<Job>,
 }
 
 unsafe impl Send for QueueFence {}
 
 static FENCES: Mutex<Option<HashMap<usize, QueueFence>>> = Mutex::new(None);
 
-/// how long the worker waits for one submission before writing anyway (a removed device, a
-/// queue that never gets there)
+/// A bounded wait interval, not permission to publish incomplete GPU work.
 const WAIT_MS: u32 = 10_000;
 
-fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
-    static W: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
-    W.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Job>();
-        let spawned = std::thread::Builder::new().name("xcl-cpu-writes".into()).spawn(move || unsafe {
-            let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
-            for job in rx {
-                if job.fence.GetCompletedValue() < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
-                    th::WaitForSingleObject(event, WAIT_MS);
-                }
-                for w in &job.writes {
-                    match w {
-                        Write::Immediate(va, words) => write_now(*va, words),
-                        Write::ReadbackU64 { va, src, .. } => {
-                            let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
-                            write_u64_now(*va, value);
+/// Each queue has its own FIFO worker. A blocked graphics fence must not
+/// prevent an independent compute or copy queue from publishing its completion.
+fn worker(queue: usize) -> std::io::Result<mpsc::Sender<Job>> {
+    let (tx, rx) = mpsc::channel::<Job>();
+    std::thread::Builder::new().name(format!("xcl-cpu-writes-{queue:x}")).spawn(move || unsafe {
+        let event = CreateEventW(None, false, false, None).ok();
+        for job in rx {
+            loop {
+                match crate::gpu::fence::wait(&job.fence, job.value, &job.device, event, WAIT_MS) {
+                    Ok(()) => {
+                        for w in &job.writes {
+                            match w {
+                                Write::Immediate(va, words) => write_now(*va, words),
+                                Write::ReadbackU64 { va, src, .. } => {
+                                    let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
+                                    write_u64_now(*va, value);
+                                }
+                            }
                         }
+                        break;
+                    }
+                    Err(crate::gpu::fence::FenceError::Timeout(_)) => {
+                        crate::xlog_warn!("D3D12.X: CPU writeback queue {queue:#x}, fence {} still pending; completion values withheld", job.value);
+                        // Preserve FIFO and resource ownership while work is in flight.
+                    }
+                    Err(e) => {
+                        crate::xlog_error!("D3D12.X: CPU writeback queue {queue:#x}, fence {}: {e}; completion values withheld", job.value);
+                        // On a non-timeout API failure the GPU may still own the
+                        // readback resources; retain this job rather than free them.
+                        if !matches!(e, crate::gpu::fence::FenceError::Removed(_)) {
+                            std::mem::forget(job);
+                        }
+                        break;
                     }
                 }
             }
-        });
-        if let Err(e) = spawned {
-            crate::xlog_error!("D3D12.X: no thread for the writes after the GPU: {e}");
         }
-        Mutex::new(tx)
-    })
+        if let Some(event) = event { let _ = CloseHandle(event); }
+    })?;
+    Ok(tx)
+}
+
+/// Drop the sender when the title releases its queue. Already enqueued jobs
+/// retain their own fence/device/resources until completion.
+pub(super) fn forget_queue(queue: usize) {
+    if let Some(m) = FENCES.lock().unwrap().as_mut() { m.remove(&queue); }
 }
 
 /// The dwords at `va`, if the memory is still there and writable.
@@ -128,7 +150,7 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
         return;
     }
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
-    let job = {
+    {
         let mut g = FENCES.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
         let entry = match m.entry(queue as usize) {
@@ -140,18 +162,30 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
                 }
                 let Some(dev) = dev else { return };
                 let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
-                v.insert(QueueFence { fence, value: 0 })
+                let sender = match worker(queue as usize) {
+                    Ok(sender) => sender,
+                    Err(e) => {
+                        crate::xlog_error!("D3D12.X: cannot start CPU writeback worker: {e}");
+                        return;
+                    }
+                };
+                v.insert(QueueFence { device: dev, fence, value: 0, sender })
             }
         };
         entry.value += 1;
         if q.Signal(&entry.fence, entry.value).is_err() {
             return;
         }
-        Job { fence: entry.fence.clone(), value: entry.value, writes }
-    };
-    static FIRST: std::sync::Once = std::sync::Once::new();
-    FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len()));
-    let _ = worker().lock().unwrap().send(job);
+        let job = Job { device: entry.device.clone(), fence: entry.fence.clone(), value: entry.value, writes };
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory use per-queue CPU workers after GPU completion ({} in the first submission)", job.writes.len()));
+        // Enqueue while the fence sequence is protected so two submitting
+        // threads cannot reverse the ordering of their writebacks.
+        if let Err(e) = entry.sender.send(job) {
+            crate::xlog_error!("D3D12.X: CPU writeback worker disconnected on queue {:#x}", queue as usize);
+            std::mem::forget(e.0);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -182,6 +216,46 @@ mod tests {
                 std::thread::yield_now();
             }
             assert_eq!(*cell, [7, 9]);
+        }
+    }
+
+    /// A blocked queue must not prevent an independent queue from publishing a completed write.
+    #[test]
+    fn independent_queue_writeback_is_not_blocked_by_other_queue() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.unwrap();
+            let desc = D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() };
+            let blocked: ID3D12CommandQueue = dev.CreateCommandQueue(&desc).unwrap();
+            let ready: ID3D12CommandQueue = dev.CreateCommandQueue(&desc).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let a = Box::new(AtomicU32::new(0));
+            let b = Box::new(AtomicU32::new(0));
+            blocked.Wait(&gate, 1).unwrap();
+            after(blocked.as_raw(), vec![Write::Immediate(&*a as *const AtomicU32 as usize, vec![17])]);
+            after(ready.as_raw(), vec![Write::Immediate(&*b as *const AtomicU32 as usize, vec![23])]);
+            let start = std::time::Instant::now();
+            while b.load(Ordering::Acquire) == 0 && start.elapsed().as_secs() < 3 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let independent = b.load(Ordering::Acquire) == 23 && a.load(Ordering::Acquire) == 0;
+            gate.Signal(1).unwrap();
+            let start = std::time::Instant::now();
+            while (a.load(Ordering::Acquire) == 0 || b.load(Ordering::Acquire) == 0) && start.elapsed().as_secs() < 5 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let completed = a.load(Ordering::Acquire) == 17 && b.load(Ordering::Acquire) == 23;
+            forget_queue(blocked.as_raw() as usize);
+            forget_queue(ready.as_raw() as usize);
+            // A failed test must not release cells still referenced by an asynchronous job.
+            if !completed { std::mem::forget(a); std::mem::forget(b); }
+            assert!(completed, "both writebacks must finish after gate signal");
+            assert!(independent, "independent queue must publish before blocked queue is released");
         }
     }
 
