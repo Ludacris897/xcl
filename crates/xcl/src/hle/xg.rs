@@ -805,33 +805,27 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
     let Some(to_end) = (dst as usize).checked_add(span) else { return E_INVALIDARG };
     let Some(from_end) = from.checked_add(source_len) else { return E_INVALIDARG };
 
-    // Evaluate both predicates, even if the destination fails, so the logs identify
-    // which pointer contract failed. A successful query is not a guarantee against
-    // concurrent decommit; this is an early refusal, not a race-proof memory copy.
-    let destination_readable = crate::gpu::shader::readable(dst as usize, span);
-    let source_readable = crate::gpu::shader::readable(from, source_len);
-    if !destination_readable || !source_readable {
+    // The kernel read/write helpers below already check memory accessibility. Avoid
+    // expensive VirtualQuery walks on successful copies: on multi-GiB mappings a
+    // redundant range probe can cost far more than the texture copy itself.
+    // Recheck *both* ranges on failure so the log still explains rejected calls.
+    let report_access_failure = |what: &str| {
         static N: AtomicU32 = AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 16 {
+            let destination_readable = crate::gpu::shader::readable(dst as usize, span);
+            let source_readable = crate::gpu::shader::readable(from, source_len);
             crate::xlog_warn!(
-                "XGTextureAddressComputer::CopyFromSubresource: refused – destination {:#x}..{to_end:#x} readable={destination_readable}, source {from:#x}..{from_end:#x} readable={source_readable} (plane {plane}, subresource {sub}, level {i} {}x{}x{}, {row} bytes a row, row pitch {row_pitch}, slice pitch {slice_pitch})",
-                dst as usize,
-                m.width,
-                m.height,
-                m.depth
+                "XGTextureAddressComputer::CopyFromSubresource: {what} – destination {:#x}..{to_end:#x} readable={destination_readable}, source {from:#x}..{from_end:#x} readable={source_readable} (plane {plane}, subresource {sub}, level {i} {}x{}x{}, {row} bytes a row, row pitch {row_pitch}, slice pitch {slice_pitch})",
+                dst as usize, m.width, m.height, m.depth
             );
         }
-        return E_INVALIDARG;
-    }
+        E_INVALIDARG
+    };
 
-    // The early range checks reject clearly invalid calls. Kernel-mediated copies also
+    // Checked pitch/address arithmetic rejects clearly invalid calls. Kernel-mediated copies
     // prevent a concurrent title unmap from becoming an unhandled XCL access violation.
     let Some(tiled) = read_title_snapshot(from, source_len) else {
-        static N: AtomicU32 = AtomicU32::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) < 16 {
-            crate::xlog_warn!("XGTextureAddressComputer::CopyFromSubresource: source disappeared during copy at {from:#x} ({source_len} bytes)");
-        }
-        return E_INVALIDARG;
+        return report_access_failure("source read failed");
     };
 
     if t.depth > 0 {
@@ -839,13 +833,13 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
         let slice_bytes = row.checked_mul(m.height);
         if row_pitch as usize == row && slice_bytes == Some(slice_pitch as usize) {
             if !write_title_bytes(dst as usize, &linear) {
-                return E_INVALIDARG;
+                return report_access_failure("destination write failed");
             }
         } else {
             for (n, chunk) in linear.chunks_exact(row).enumerate() {
                 let to = n / m.height * slice_pitch as usize + n % m.height * row_pitch as usize;
                 if !write_title_bytes(dst as usize + to, chunk) {
-                    return E_INVALIDARG;
+                    return report_access_failure("destination pitched write failed");
                 }
             }
         }
@@ -854,12 +848,12 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
     let linear = t.chain.detile_level(&tiled, i, k);
     if row_pitch as usize == row {
         if !write_title_bytes(dst as usize, &linear[..m.height * row]) {
-            return E_INVALIDARG;
+            return report_access_failure("destination write failed");
         }
     } else {
         for y in 0..m.height {
             if !write_title_bytes(dst as usize + y * row_pitch as usize, &linear[y * row..(y + 1) * row]) {
-                return E_INVALIDARG;
+                return report_access_failure("destination pitched write failed");
             }
         }
     }
