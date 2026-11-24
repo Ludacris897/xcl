@@ -333,6 +333,9 @@ static PERF_DETILE_US: AtomicU64 = AtomicU64::new(0);
 static PERF_SOURCE_READ_US: AtomicU64 = AtomicU64::new(0);
 static PERF_TILING_ONLY_US: AtomicU64 = AtomicU64::new(0);
 static PERF_SOURCE_BYTES: AtomicU64 = AtomicU64::new(0);
+static PERF_BULK_READ_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static PERF_BULK_READ_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static PERF_BULK_READ_BYTES: AtomicU64 = AtomicU64::new(0);
 static PERF_GPU_BATCH_US: AtomicU64 = AtomicU64::new(0);
 static PERF_BATCHES: AtomicU64 = AtomicU64::new(0);
 static PERF_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -391,6 +394,14 @@ fn perf_report() {
         PERF_SOURCE_BYTES.load(Ordering::Relaxed) >> 20,
         us(&PERF_TILING_ONLY_US)
     );
+    if bulk_title_reads_enabled() {
+        crate::xlog_info!(
+            "XCL PERF guarded bulk texture reads: {} successes / {} attempts, {} MiB read without a VirtualQuery region walk",
+            PERF_BULK_READ_SUCCESSES.load(Ordering::Relaxed),
+            PERF_BULK_READ_ATTEMPTS.load(Ordering::Relaxed),
+            PERF_BULK_READ_BYTES.load(Ordering::Relaxed) >> 20,
+        );
+    }
     let watch_calls = PERF_WATCH_CALLS.load(Ordering::Relaxed);
     if watch_calls > 0 {
         crate::xlog_info!(
@@ -1139,6 +1150,31 @@ fn watch_ranges_with_gap(regions: &[(usize, usize)], mut wanted: Vec<(usize, usi
     out
 }
 
+/// Try copying a complete contiguous title range using a guarded OS read. This is
+/// faster than walking VirtualQuery regions when *all* pages are committed and readable,
+/// but may add one failed syscall on sparse allocations. For that reason it is opt-in.
+fn bulk_title_reads_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_TITLE_BULK_READ").is_ok_and(|v| v == "1"))
+}
+
+/// The operation fails rather than dereferencing an unmapped or decommitted guest page.
+unsafe fn try_bulk_title_snapshot(at: usize, out: &mut [u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if out.is_empty() {
+        return true;
+    }
+    let mut done = 0usize;
+    ReadProcessMemory(
+        GetCurrentProcess(),
+        at as *const c_void,
+        out.as_mut_ptr() as *mut c_void,
+        out.len(),
+        &mut done,
+    ) != 0 && done == out.len()
+}
+
 /// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
 /// has only some of its pages mapped).
 unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
@@ -1149,6 +1185,23 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
         return out;
+    }
+    // One guarded whole-range copy can avoid thousands of VirtualQuery + read
+    // calls when the range is truly contiguous and resident. A partial/failed
+    // attempt must *not* leak bytes from an unreadable region: reset the output
+    // before the existing region-by-region path.
+    if bulk_title_reads_enabled() {
+        if perf_enabled() {
+            PERF_BULK_READ_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        }
+        if try_bulk_title_snapshot(at, &mut out) {
+            if perf_enabled() {
+                PERF_BULK_READ_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+                PERF_BULK_READ_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+            }
+            return out;
+        }
+        out.fill(0);
     }
     let mut p = at;
     while p < at + len {
@@ -1237,6 +1290,17 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_texture_snapshot_reads_valid_contiguous_ranges_and_rejects_bad_pages() {
+        let original: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let mut out = vec![0u8; original.len()];
+        unsafe {
+            assert!(try_bulk_title_snapshot(original.as_ptr() as usize, &mut out));
+            assert_eq!(original, out);
+            assert!(!try_bulk_title_snapshot(0x10, &mut out));
+        }
+    }
 
     #[test]
     fn configurable_upload_batch_preserves_default_and_bounds() {
