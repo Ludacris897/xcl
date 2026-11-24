@@ -245,6 +245,21 @@ fn coalesced_uploads_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("XCL_COALESCE_UPLOADS").is_ok_and(|v| v == "1"))
 }
 
+static COALESCED_BATCHES: AtomicU64 = AtomicU64::new(0);
+static COALESCED_TEXTURES: AtomicU64 = AtomicU64::new(0);
+static COALESCED_STAGE_BYTES: AtomicU64 = AtomicU64::new(0);
+static COALESCED_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// (coalesced GPU batches, staged textures, staging MiB, fallback batches)
+pub fn coalescing_stats() -> (u64, u64, u64, u64) {
+    (
+        COALESCED_BATCHES.load(Ordering::Relaxed),
+        COALESCED_TEXTURES.load(Ordering::Relaxed),
+        COALESCED_STAGE_BYTES.load(Ordering::Relaxed) >> 20,
+        COALESCED_FALLBACKS.load(Ordering::Relaxed),
+    )
+}
+
 /// D3D12 requires placed texture footprints to begin at 512-byte boundaries.
 fn placed_range(offset: u64, size: u64) -> Option<(u64, u64)> {
     let start = offset.checked_add(511)? & !511;
@@ -270,6 +285,10 @@ unsafe fn upload_batch_coalesced(
     if items.is_empty() {
         return Ok(Vec::new());
     }
+    let fallback = || {
+        COALESCED_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        upload_batch_legacy(dev, queue, items)
+    };
     // Cap staging independently of the texture pool's console-byte budget:
     // D3D12 row pitch padding can substantially enlarge the actual upload.
     const MAX_STAGE_BYTES: u64 = 512 << 20;
@@ -305,14 +324,14 @@ unsafe fn upload_batch_coalesced(
             Err(e) => { failed.push((item, e)); continue },
         };
         let Some((base, end)) = placed_range(total, bytes) else {
-            return upload_batch_legacy(dev, queue, items);
+            return fallback();
         };
         if end > MAX_STAGE_BYTES {
-            return upload_batch_legacy(dev, queue, items);
+            return fallback();
         }
         for fp in &mut fps {
             let Some(at) = fp.Offset.checked_add(base) else {
-                return upload_batch_legacy(dev, queue, items);
+                return fallback();
             };
             fp.Offset = at;
         }
@@ -379,6 +398,9 @@ unsafe fn upload_batch_coalesced(
     let result = wait(dev, queue);
     drop(up);
     result?;
+    COALESCED_BATCHES.fetch_add(1, Ordering::Relaxed);
+    COALESCED_TEXTURES.fetch_add(layouts.len() as u64, Ordering::Relaxed);
+    COALESCED_STAGE_BYTES.fetch_add(total, Ordering::Relaxed);
     Ok(failed)
 }
 
