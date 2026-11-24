@@ -73,6 +73,19 @@ pub struct Layout {
     hz: Vec<u32>,
 }
 
+/// Experimental fast path, disabled by default for controlled A/B testing.
+/// Use the same binary and toggle XCL_FAST_DETILE between process launches.
+fn fast_detile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_FAST_DETILE").is_ok_and(|v| v == "1"))
+}
+
+/// Avoid allocating x-coordinate scratch for tiny mips, where scalar setup is cheap.
+fn fast_detile_worthwhile(width: usize, height: usize, depth: usize) -> bool {
+    width <= 32768 && height.saturating_mul(depth) >= 4 &&
+        width.saturating_mul(height).saturating_mul(depth) >= 4096
+}
+
 impl Layout {
     /// A 2D surface (or one slice of an array). `None` for unknown / reserved modes and
     /// elements over 16 B. Linear (0): rows padded to 256 bytes (addrlib
@@ -175,8 +188,64 @@ impl Layout {
         block * self.block_bytes + (xor as usize ^ self.base_xor)
     }
 
+    /// Each x coordinate contributes a whole-block byte offset and an in-block
+    /// XOR. These are independent of y and z and can be computed once per mip,
+    /// rather than repeatedly in the per-element inner loop.
+    fn detile_rows<const E: usize>(
+        &self, src: &[u8], out: &mut [u8], width: usize, height: usize,
+        depth: usize, pitch: usize, origin: (usize, usize), base: usize,
+        z_start: usize, layer_stride: usize,
+    ) {
+        let pitch_blocks = pitch.div_ceil(self.block_w);
+        let x_terms: Vec<(usize, usize)> = (origin.0..origin.0 + width).map(|x| {
+            let block = x / self.block_w;
+            let xor = self.ox[x % self.block_w] ^ self.hx[block % self.hx.len()];
+            (block * self.block_bytes, xor as usize)
+        }).collect();
+        for dz in 0..depth {
+            let z = z_start + dz;
+            let z_term = (self.oz[z % self.block_d] ^ self.hz[(z / self.block_d) % self.hz.len()]) as usize;
+            let layer_base = base + (z / self.block_d) * layer_stride;
+            for dy in 0..height {
+                let y = origin.1 + dy;
+                let y_block = y / self.block_h;
+                let y_term = (self.oy[y % self.block_h] ^ self.hy[y_block % self.hy.len()]) as usize;
+                let row_base = layer_base + y_block * pitch_blocks * self.block_bytes;
+                let xor = y_term ^ z_term ^ self.base_xor;
+                let dest = &mut out[(dz * height + dy) * width * E..][..width * E];
+                for (d, &(block, x)) in dest.chunks_exact_mut(E).zip(&x_terms) {
+                    let offset = row_base + block + (x ^ xor);
+                    if let Some(data) = src.get(offset..offset + E) {
+                        d.copy_from_slice(data);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dispatch once per mip so element copies have a compile-time width.
+    fn detile_separable(
+        &self, src: &[u8], width: usize, height: usize, depth: usize,
+        pitch: usize, origin: (usize, usize), base: usize,
+        z_start: usize, layer_stride: usize,
+    ) -> Vec<u8> {
+        let mut out = vec![0u8; width * height * depth * (1 << self.elem_log2)];
+        match self.elem_log2 {
+            0 => self.detile_rows::<1>(src, &mut out, width, height, depth, pitch, origin, base, z_start, layer_stride),
+            1 => self.detile_rows::<2>(src, &mut out, width, height, depth, pitch, origin, base, z_start, layer_stride),
+            2 => self.detile_rows::<4>(src, &mut out, width, height, depth, pitch, origin, base, z_start, layer_stride),
+            3 => self.detile_rows::<8>(src, &mut out, width, height, depth, pitch, origin, base, z_start, layer_stride),
+            4 => self.detile_rows::<16>(src, &mut out, width, height, depth, pitch, origin, base, z_start, layer_stride),
+            _ => unreachable!("unsupported element width"),
+        }
+        out
+    }
+
     /// tiled → linear rows (`w << elem_log2` bytes each); bytes past the end of `src` read as 0
     pub fn detile(&self, src: &[u8], w: usize, h: usize) -> Vec<u8> {
+        if fast_detile_enabled() && fast_detile_worthwhile(w, h, 1) {
+            return self.detile_separable(src, w, h, 1, w, (0, 0), 0, 0, 0);
+        }
         let e = 1usize << self.elem_log2;
         let mut out = vec![0u8; w * h * e];
         for y in 0..h {
@@ -363,6 +432,10 @@ impl Chain {
     /// bytes past the end of `mem` read as 0
     pub fn detile_volume(&self, mem: &[u8], i: usize) -> Vec<u8> {
         let l = self.levels[i];
+        if fast_detile_enabled() && fast_detile_worthwhile(l.width, l.height, l.depth) {
+            return self.layout.detile_separable(mem, l.width, l.height, l.depth, l.pitch,
+                l.origin, l.offset, 0, self.slice_bytes);
+        }
         let e = 1usize << self.layout.elem_log2;
         let mut out = vec![0u8; l.width * l.height * l.depth * e];
         for z in 0..l.depth {
@@ -396,6 +469,10 @@ impl Chain {
     /// bytes past the end of `src` read as 0
     pub fn detile_level(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
         let l = self.levels[i];
+        if fast_detile_enabled() && fast_detile_worthwhile(l.width, l.height, 1) {
+            return self.layout.detile_separable(src, l.width, l.height, 1, l.pitch,
+                l.origin, l.offset, slice, 0);
+        }
         let e = 1usize << self.layout.elem_log2;
         let mut out = vec![0u8; l.width * l.height * e];
         for y in 0..l.height {
@@ -445,6 +522,84 @@ mod tests {
             v.push(PipeConfig { pipes_log2: p, pkrs_log2: k });
         }
         v
+    }
+
+    /// Independent scalar oracle: use the original address function for each element.
+    fn reference_detile(layout: &Layout, src: &[u8], l: MipLevel, z_start: usize, layer_stride: usize) -> Vec<u8> {
+        let e = 1 << layout.elem_log2;
+        let mut out = vec![0; l.width * l.height * l.depth * e];
+        for dz in 0..l.depth {
+            let z = z_start + dz;
+            for y in 0..l.height {
+                for x in 0..l.width {
+                    let offset = l.offset + (z / layout.block_d) * layer_stride
+                        + layout.offset_z(x + l.origin.0, y + l.origin.1, z, l.pitch);
+                    if let Some(bytes) = src.get(offset..offset + e) {
+                        out[((dz * l.height + y) * l.width + x) * e..][..e].copy_from_slice(bytes);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn separable_detile_matches_scalar_on_mips_slices_and_short_sources() {
+        for mode in std::iter::once(0).chain(MODES) {
+            for e in 0..5 {
+                for cfg in [PipeConfig { pipes_log2: 0, pkrs_log2: 0 },
+                            PipeConfig { pipes_log2: 4, pkrs_log2: 3 }] {
+                    let Some(mut layout) = Layout::new(mode, e, cfg) else { continue };
+                    layout.base_xor = (layout.block_bytes / 2) & !((1 << e) - 1);
+                    let chain = Chain::new(layout, 97, 71, 1, 7);
+                    let src: Vec<u8> = (0..chain.slice_bytes).map(|i| ((i ^ (i >> 8)) % 251) as u8).collect();
+                    for &l in &chain.levels {
+                        for slice in [0, 1, 13] {
+                            for input in [&src[..], &src[..src.len() / 2]] {
+                                let expected = reference_detile(&chain.layout, input, l, slice, 0);
+                                let actual = chain.layout.detile_separable(input, l.width, l.height, 1, l.pitch, l.origin, l.offset, slice, 0);
+                                assert_eq!(actual, expected, "mode {mode}, e {e}, {cfg:?}, mip {l:?}, slice {slice}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn separable_detile_matches_scalar_for_3d_thick_and_thin_textures() {
+        let cfg = PipeConfig { pipes_log2: 3, pkrs_log2: 2 };
+        for mode in [0, 5, 9, 17, 21, 24, 25, 26, 27] {
+            for e in 0..5 {
+                let Some(layout) = Layout::new_3d(mode, e, cfg) else { continue };
+                let c = Chain::new_3d(layout, 37, 29, 9, 1, 5);
+                let src: Vec<u8> = (0..c.layers() * c.slice_bytes).map(|i| ((i ^ (i >> 9)) % 253) as u8).collect();
+                for &l in &c.levels {
+                    let expected = reference_detile(&c.layout, &src, l, 0, c.slice_bytes);
+                    let actual = c.layout.detile_separable(&src, l.width, l.height, l.depth, l.pitch, l.origin, l.offset, 0, c.slice_bytes);
+                    assert_eq!(actual, expected, "mode {mode}, e {e}, mip {l:?}");
+                }
+            }
+        }
+    }
+
+    /// Run manually in release mode with --ignored --nocapture.
+    #[test]
+    #[ignore = "microbenchmark, not a timing-dependent CI assertion"]
+    fn separable_detile_microbenchmark() {
+        let cfg = PipeConfig { pipes_log2: 3, pkrs_log2: 2 };
+        let c = Chain::new(Layout::new(10, 4, cfg).unwrap(), 2048, 2048, 4, 1);
+        let l = c.levels[0];
+        let src = vec![0x5a; c.slice_bytes];
+        let iterations = 20;
+        let t = std::time::Instant::now();
+        for _ in 0..iterations { std::hint::black_box(reference_detile(&c.layout, &src, l, 0, 0)); }
+        let scalar = t.elapsed();
+        let t = std::time::Instant::now();
+        for _ in 0..iterations { std::hint::black_box(c.layout.detile_separable(&src, l.width, l.height, 1, l.pitch, l.origin, l.offset, 0, 0)); }
+        let fast = t.elapsed();
+        eprintln!("scalar: {scalar:?}; separable: {fast:?}; speedup: {:.2}x", scalar.as_secs_f64() / fast.as_secs_f64());
     }
 
     /// every mode, element size and pipe configuration: the in-block mapping is a permutation
