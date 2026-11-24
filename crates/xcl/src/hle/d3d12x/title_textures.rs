@@ -1056,26 +1056,52 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
 unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut out = vec![0u8; len];
-    // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
-    // walking it)
+    let Some(limit) = at.checked_add(len) else { return out };
+    if len == 0 { return out; }
+    // XCL owns the coherent window and commits it for the lifetime of the title.
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
         return out;
     }
+    // Most title allocations are fully readable. One guarded read avoids the
+    // VirtualQuery region walk and cannot fault a detile worker on a decommit race.
+    if read_title_range(at, &mut out) { return out; }
+    out.fill(0);
     let mut p = at;
-    while p < at + len {
+    while p < limit {
         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
         if VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 {
             break;
         }
-        let end = (m.BaseAddress as usize + m.RegionSize).min(at + len);
-        let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0; // R / RW / WC / X-R…, no guard
+        let end = (m.BaseAddress as usize).saturating_add(m.RegionSize).min(limit);
+        if end <= p { break; }
+        let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0;
         if readable {
-            std::ptr::copy_nonoverlapping(p as *const u8, out.as_mut_ptr().add(p - at), end - p);
+            let target = &mut out[p - at..end - at];
+            if !read_title_range(p, target) {
+                // A region may have changed after VirtualQuery. Preserve the
+                // readable portions, and leave pages that disappeared as zeros.
+                let mut q = p;
+                while q < end {
+                    let next = (q | 0xfff).saturating_add(1).min(end);
+                    if next <= q { break; }
+                    let page = &mut out[q - at..next - at];
+                    if !read_title_range(q, page) { page.fill(0); }
+                    q = next;
+                }
+            }
         }
         p = end;
     }
     out
+}
+
+/// Guarded self-process snapshot. On failure the caller must discard partial bytes.
+unsafe fn read_title_range(at: usize, out: &mut [u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut read = 0usize;
+    ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out.as_mut_ptr().cast(), out.len(), &mut read) != 0 && read == out.len()
 }
 
 /// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
@@ -1122,10 +1148,11 @@ unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> V
     out
 }
 
-/// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
-/// as much as the detile of a video frame), else read page run by page run.
+/// Borrow only the XCL-owned, fully committed coherent window. A readable
+/// title-owned mapping can be decommitted immediately after a readability
+/// check; use a guarded snapshot there, including for hashing and parallel detiling.
 unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
-    if crate::gpu::shader::readable(at, len) {
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
     } else {
         std::borrow::Cow::Owned(read_committed(at, len))
@@ -1459,7 +1486,7 @@ mod tests {
     /// The title's bytes are used where they are when all of them are readable, and read with the
     /// pages that are not committed as zeros otherwise – the same bytes either way.
     #[test]
-    fn title_bytes_are_used_in_place_when_all_are_readable() {
+    fn title_bytes_snapshot_readable_and_sparse_title_memory() {
         use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
         unsafe {
             let base = VirtualAlloc(std::ptr::null(), 3 << 12, MEM_RESERVE, PAGE_READWRITE) as usize;
@@ -1469,13 +1496,17 @@ mod tests {
                 std::ptr::write_bytes((base + (page << 12)) as *mut u8, 0xA0 + page as u8, 1 << 12);
             }
             let whole = title_bytes(base, 1 << 12);
-            assert!(matches!(whole, std::borrow::Cow::Borrowed(_)), "a committed page is not copied");
-            assert_eq!(whole.as_ptr() as usize, base);
+            assert!(matches!(whole, std::borrow::Cow::Owned(_)), "title-owned pages must be snapshotted");
+            assert_ne!(whole.as_ptr() as usize, base);
             assert!(whole.iter().all(|&b| b == 0xA0));
             let holed = title_bytes(base, 3 << 12);
             assert!(matches!(holed, std::borrow::Cow::Owned(_)), "a range with a reserved page is read");
             assert_eq!(&holed[..], &read_committed(base, 3 << 12)[..]);
             assert!(holed[..1 << 12].iter().all(|&b| b == 0xA0) && holed[1 << 12..2 << 12].iter().all(|&b| b == 0) && holed[2 << 12..].iter().all(|&b| b == 0xA2));
+            assert_ne!(VirtualFree(base as *mut c_void, 1 << 12, windows_sys::Win32::System::Memory::MEM_DECOMMIT), 0);
+            assert!(whole.iter().all(|&b| b == 0xA0), "snapshot survives later decommit");
+            let missing = title_bytes(base, 1 << 12);
+            assert!(missing.iter().all(|&b| b == 0), "decommitted page reads as zero");
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
     }
