@@ -27,6 +27,22 @@ The new logger reports `XCL PERF texture fence waits` and
 `XCL PERF coalesced upload`, alongside existing detile/GPU-batch timing.
 All diagnostics require `XCL_PERF=1`.
 
+### Optional guarded bulk texture reads
+
+Comparing the original `main` branch to newer crash-safe streaming code
+reveals another potential overhead: `main` used direct `memcpy` for
+committed texture pages; the newer branch uses `ReadProcessMemory` so a
+concurrently decommitted page cannot crash the host in the copy operation.
+Simply reverting to raw memory dereferencing is **not** a safe performance
+fix. When `XCL_TITLE_BULK_READ=1`, the new code tries one guarded
+whole-range `ReadProcessMemory` call **before** walking the
+`VirtualQuery` regions. If the whole read fails or is partial, it clears
+the partially copied output and uses the original safe region-by-region
+path. The default is **OFF** because this extra syscall can hurt sparse
+memory workloads. With `XCL_PERF=1`, an additional log line shows
+successful/attempted bulk reads and MiB delivered without a region walk.
+A/B this separately from both upload coalescing and watch-gap experiments.
+
 ## Controlled comparison
 
 Each of the following is a **single PowerShell line**. Run one trial at a
