@@ -542,7 +542,7 @@ pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(),
                 WAIT_REUSED.fetch_add(1, Ordering::Relaxed);
                 return Ok((entry.fence.clone(), next, entry.event));
             }
-            let fresh = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
+            let fresh: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
                 .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
             entry.fence = fresh.clone();
             entry.value = 1;
