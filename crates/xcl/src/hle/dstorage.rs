@@ -1477,6 +1477,21 @@ mod tests {
     }
 
     #[test]
+    fn experimental_bc1_acceptance_requires_whole_blocks_and_no_swizzle() {
+        let b = request(1 << BCPACK_SHIFT, 0x1000, 8192, 0x2000, 0, 5000);
+        let r = Request::parse(&b);
+        assert!(r.bcpack_bc1_shape());
+        let partial = Request::parse(&request(1 << BCPACK_SHIFT, 0x1000, 8191, 0x2000, 0, 5000));
+        assert!(!partial.bcpack_bc1_shape());
+        let bc7 = Request::parse(&request(7 << BCPACK_SHIFT, 0x1000, 8192, 0x2000, 0, 5000));
+        assert!(!bc7.bcpack_bc1_shape());
+        let swizzled = Request::parse(&request((1 << BCPACK_SHIFT) | (1 << SWIZZLE_SHIFT), 0x1000, 8192, 0x2000, 0, 5000));
+        assert!(!swizzled.bcpack_bc1_shape());
+        let zlib_without_intermediate = Request::parse(&request((1 << BCPACK_SHIFT) | ZLIB_BIT, 0x1000, 8192, 0x2000, 0, 5000));
+        assert!(!zlib_without_intermediate.bcpack_bc1_shape());
+    }
+
+    #[test]
     fn a_refused_factory_iid_returns_e_nointerface_and_clears_out() {
         unsafe {
             // The two IIDs the factory answers.
