@@ -718,6 +718,47 @@ fn copy_destination_span(
     (depth - 1).checked_mul(slice_pitch)?.checked_add(one_slice)
 }
 
+/// Take a snapshot through the kernel rather than dereferencing title-owned pages.
+/// The title may decommit a page after an earlier VirtualQuery/readability check.
+fn read_title_snapshot(address: usize, len: usize) -> Option<Vec<u8>> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).ok()?;
+    out.resize(len, 0);
+    let mut copied = 0usize;
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            address as *const c_void,
+            out.as_mut_ptr() as *mut c_void,
+            len,
+            &mut copied,
+        )
+    };
+    (ok != 0 && copied == len).then_some(out)
+}
+
+/// Write title-owned memory through the kernel: a concurrent unmap becomes a failed
+/// HRESULT rather than an access violation in this copy routine.
+fn write_title_bytes(address: usize, data: &[u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut copied = 0usize;
+    let ok = unsafe {
+        WriteProcessMemory(
+            GetCurrentProcess(),
+            address as *mut c_void,
+            data.as_ptr() as *const c_void,
+            data.len(),
+            &mut copied,
+        )
+    };
+    ok != 0 && copied == data.len()
+}
+
 /// The level's place in the resource at `src` → rows of `dst` (`row_pitch` apart).
 /// A retail game's calls carry an extra 8-byte value before the CPU resource pointer.
 /// Its observed value is 0x7_0000_0000; its meaning is still unknown. Treating the
@@ -783,18 +824,44 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
         return E_INVALIDARG;
     }
 
+    // The early range checks reject clearly invalid calls. Kernel-mediated copies also
+    // prevent a concurrent title unmap from becoming an unhandled XCL access violation.
+    let Some(tiled) = read_title_snapshot(from, source_len) else {
+        static N: AtomicU32 = AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 16 {
+            crate::xlog_warn!("XGTextureAddressComputer::CopyFromSubresource: source disappeared during copy at {from:#x} ({source_len} bytes)");
+        }
+        return E_INVALIDARG;
+    };
+
     if t.depth > 0 {
-        let linear = t.chain.detile_volume(std::slice::from_raw_parts(from as *const u8, source_len), i);
-        for (n, chunk) in linear.chunks_exact(row).enumerate() {
-            let to = n / m.height * slice_pitch as usize + n % m.height * row_pitch as usize;
-            std::ptr::copy_nonoverlapping(chunk.as_ptr(), dst.add(to), row);
+        let linear = t.chain.detile_volume(&tiled, i);
+        let slice_bytes = row.checked_mul(m.height);
+        if row_pitch as usize == row && slice_bytes == Some(slice_pitch as usize) {
+            if !write_title_bytes(dst as usize, &linear) {
+                return E_INVALIDARG;
+            }
+        } else {
+            for (n, chunk) in linear.chunks_exact(row).enumerate() {
+                let to = n / m.height * slice_pitch as usize + n % m.height * row_pitch as usize;
+                if !write_title_bytes(dst as usize + to, chunk) {
+                    return E_INVALIDARG;
+                }
+            }
         }
         return S_OK;
     }
-    let slice = std::slice::from_raw_parts(from as *const u8, source_len);
-    let linear = t.chain.detile_level(slice, i, k);
-    for y in 0..m.height {
-        std::ptr::copy_nonoverlapping(linear[y * row..].as_ptr(), dst.add(y * row_pitch as usize), row);
+    let linear = t.chain.detile_level(&tiled, i, k);
+    if row_pitch as usize == row {
+        if !write_title_bytes(dst as usize, &linear[..m.height * row]) {
+            return E_INVALIDARG;
+        }
+    } else {
+        for y in 0..m.height {
+            if !write_title_bytes(dst as usize + y * row_pitch as usize, &linear[y * row..(y + 1) * row]) {
+                return E_INVALIDARG;
+            }
+        }
     }
     S_OK
 }
@@ -865,6 +932,17 @@ mod tests {
         assert_eq!(copy_destination_span(8, 4, 1, 4, 0, 0), None);
         assert_eq!(copy_destination_span(8, 4, 1, 4, 31, 0), None);
         assert_eq!(copy_destination_span(8, 4, 1, 4, usize::MAX, 0), None);
+    }
+
+    #[test]
+    fn guarded_title_memory_operations_refuse_invalid_pages() {
+        let src = vec![0x5Au8; 8192];
+        assert_eq!(read_title_snapshot(src.as_ptr() as usize, src.len()).as_deref(), Some(src.as_slice()));
+        assert!(read_title_snapshot(0x10, 8192).is_none());
+        assert!(!write_title_bytes(0x10, &[0x1, 0x2, 0x3]));
+        let mut dst = vec![0u8; src.len()];
+        assert!(write_title_bytes(dst.as_mut_ptr() as usize, &src));
+        assert_eq!(dst, src);
     }
 
     /// Exercise the corrected ABI with a nonzero, *unrelated* 8-byte value.
