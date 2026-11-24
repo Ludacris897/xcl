@@ -773,6 +773,18 @@ unsafe fn refresh_once(queue: *mut c_void) {
                         perf_watch_call(size, t.elapsed(), result);
                     }
                     if result != 0 {
+                        // A failed write-watch query must not disappear silently:
+                        // dirty pages from this range have not been collected.
+                        static WATCH_WARNINGS: AtomicU64 = AtomicU64::new(0);
+                        let k = WATCH_WARNINGS.fetch_add(1, Ordering::Relaxed) + 1;
+                        if k <= 8 || k.is_power_of_two() {
+                            crate::xlog_warn!(
+                                "GetWriteWatch failed #{k}: code {result} for {base:#x}..{:#x} ({} KiB, {} output slots); dirty texture updates may be missed",
+                                base.saturating_add(size),
+                                size >> 10,
+                                buf.len(),
+                            );
+                        }
                         break;
                     }
                     dirty.extend(buf[..n].iter().map(|&p| p as usize));
