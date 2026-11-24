@@ -694,13 +694,34 @@ unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, su
     S_OK
 }
 
-/// the level's place in the resource at `src` → rows of `dst` (`row_pitch` apart). A retail
-/// game's calls carry an 8-byte value before the resource (0x7_0000_0000 in every call seen,
-/// its meaning not known) and the resource after it: read as (resource, row pitch, slice
-/// pitch) a copy's second row went hundreds of MB past the buffer and the process ended in
-/// memcpy; read as (value, resource, row pitch, slice pitch) the resource is the CPU view of a
-/// title texture and the pitches are one row and one level (2048 / 262144 for 128x128 at 16
-/// bytes, 256 / 8192 for 32x32 at 8).
+/// The number of destination bytes touched by a pitched copy. We must validate *the last
+/// row*, not just the first, and reject impossible pitches before constructing raw slices.
+fn copy_destination_span(
+    width: usize,
+    height: usize,
+    depth: usize,
+    bytes_per_element: usize,
+    row_pitch: usize,
+    slice_pitch: usize,
+) -> Option<usize> {
+    if width == 0 || height == 0 || depth == 0 {
+        return None;
+    }
+    let row_bytes = width.checked_mul(bytes_per_element)?;
+    if row_bytes == 0 || row_pitch < row_bytes {
+        return None;
+    }
+    let one_slice = (height - 1).checked_mul(row_pitch)?.checked_add(row_bytes)?;
+    if depth > 1 && slice_pitch < one_slice {
+        return None;
+    }
+    (depth - 1).checked_mul(slice_pitch)?.checked_add(one_slice)
+}
+
+/// The level's place in the resource at `src` → rows of `dst` (`row_pitch` apart).
+/// A retail game's calls carry an extra 8-byte value before the CPU resource pointer.
+/// Its observed value is 0x7_0000_0000; its meaning is still unknown. Treating the
+/// resource pointer as a pitch (or adding the extra value to it) corrupted the copy.
 unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, value: u64, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
@@ -717,19 +738,43 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
             m.depth
         );
     }
-    // the bytes of `dst` the rows go to and of the resource they come from: memory that is not
-    // committed is refused rather than copied into or out of
-    let span = if t.depth > 0 { (m.depth - 1) * slice_pitch as usize } else { 0 } + (m.height - 1) * row_pitch as usize + row;
-    let from = if t.depth > 0 { (src as usize + at as usize, t.size() as usize) } else { (src as usize + at as usize + k * t.chain.slice_bytes, t.chain.slice_bytes) };
-    if row_pitch as usize > 0 && (row_pitch as usize) < row || !crate::gpu::shader::readable(dst as usize, span) || !crate::gpu::shader::readable(from.0, from.1) {
-        static N: AtomicU32 = AtomicU32::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+
+    let Some(span) = copy_destination_span(m.width, m.height, m.depth.max(1), t.bpe as usize, row_pitch as usize, slice_pitch as usize) else {
+        static BAD_PITCH: AtomicU32 = AtomicU32::new(0);
+        if BAD_PITCH.fetch_add(1, Ordering::Relaxed) < 8 {
             crate::xlog_warn!(
-                "XGTextureAddressComputer::CopyFromSubresource: refused – destination {:#x}..{:#x}, source {:#x}..{:#x} (plane {plane}, subresource {sub}, level {i} {}x{}x{}, {row} bytes a row, row pitch {row_pitch}, slice pitch {slice_pitch})",
+                "XGTextureAddressComputer::CopyFromSubresource: invalid/overflowing pitch (plane {plane}, subresource {sub}, level {i} {}x{}x{}, row bytes {row}, row pitch {row_pitch}, slice pitch {slice_pitch})",
+                m.width, m.height, m.depth
+            );
+        }
+        return E_INVALIDARG;
+    };
+
+    // `src` points to the whole tiled resource, not a base to which `value` is added.
+    // Preserve the existing plane and array-slice offsets, but check address arithmetic.
+    let source_offset = if t.depth > 0 {
+        Some(at as usize)
+    } else {
+        k.checked_mul(t.chain.slice_bytes).and_then(|offset| (at as usize).checked_add(offset))
+    };
+    let source_len = if t.depth > 0 { t.size() as usize } else { t.chain.slice_bytes };
+    let Some(from) = source_offset.and_then(|offset| (src as usize).checked_add(offset)) else {
+        return E_INVALIDARG;
+    };
+    let Some(to_end) = (dst as usize).checked_add(span) else { return E_INVALIDARG };
+    let Some(from_end) = from.checked_add(source_len) else { return E_INVALIDARG };
+
+    // Evaluate both predicates, even if the destination fails, so the logs identify
+    // which pointer contract failed. A successful query is not a guarantee against
+    // concurrent decommit; this is an early refusal, not a race-proof memory copy.
+    let destination_readable = crate::gpu::shader::readable(dst as usize, span);
+    let source_readable = crate::gpu::shader::readable(from, source_len);
+    if !destination_readable || !source_readable {
+        static N: AtomicU32 = AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 16 {
+            crate::xlog_warn!(
+                "XGTextureAddressComputer::CopyFromSubresource: refused – destination {:#x}..{to_end:#x} readable={destination_readable}, source {from:#x}..{from_end:#x} readable={source_readable} (plane {plane}, subresource {sub}, level {i} {}x{}x{}, {row} bytes a row, row pitch {row_pitch}, slice pitch {slice_pitch})",
                 dst as usize,
-                dst as usize + span,
-                from.0,
-                from.0 + from.1,
                 m.width,
                 m.height,
                 m.depth
@@ -737,15 +782,16 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
         }
         return E_INVALIDARG;
     }
+
     if t.depth > 0 {
-        let linear = t.chain.detile_volume(std::slice::from_raw_parts(from.0 as *const u8, from.1), i);
-        for (n, from) in linear.chunks_exact(row).enumerate() {
+        let linear = t.chain.detile_volume(std::slice::from_raw_parts(from as *const u8, source_len), i);
+        for (n, chunk) in linear.chunks_exact(row).enumerate() {
             let to = n / m.height * slice_pitch as usize + n % m.height * row_pitch as usize;
-            std::ptr::copy_nonoverlapping(from.as_ptr(), dst.add(to), row);
+            std::ptr::copy_nonoverlapping(chunk.as_ptr(), dst.add(to), row);
         }
         return S_OK;
     }
-    let slice = std::slice::from_raw_parts(from.0 as *const u8, from.1);
+    let slice = std::slice::from_raw_parts(from as *const u8, source_len);
     let linear = t.chain.detile_level(slice, i, k);
     for y in 0..m.height {
         std::ptr::copy_nonoverlapping(linear[y * row..].as_ptr(), dst.add(y * row_pitch as usize), row);
@@ -808,6 +854,48 @@ mod tests {
         let t = Texture::new(&desc(512, 512, 1, 1, 118, 0)).unwrap();
         assert_eq!(usages_and_bytes(&t), [(5, 2), (6, 1)]);
         assert!(t.size() >= 512 * 512 * 3 && t.size() != u64::MAX);
+    }
+
+    #[test]
+    fn copy_from_destination_span_checks_pitches_and_overflow() {
+        assert_eq!(copy_destination_span(128, 128, 1, 16, 2048, 262144), Some(262144));
+        assert_eq!(copy_destination_span(32, 32, 1, 8, 256, 8192), Some(8192));
+        assert_eq!(copy_destination_span(8, 4, 2, 4, 32, 128), Some(256));
+        assert_eq!(copy_destination_span(8, 4, 2, 4, 32, 127), None);
+        assert_eq!(copy_destination_span(8, 4, 1, 4, 0, 0), None);
+        assert_eq!(copy_destination_span(8, 4, 1, 4, 31, 0), None);
+        assert_eq!(copy_destination_span(8, 4, 1, 4, usize::MAX, 0), None);
+    }
+
+    /// Exercise the corrected ABI with a nonzero, *unrelated* 8-byte value.
+    /// `src` must be used directly as the resource pointer, never added to `value`.
+    #[test]
+    fn copy_from_uses_resource_pointer_after_extra_value() {
+        let tex = Texture::new(&desc(32, 32, 1, 1, 28, 1)).unwrap();
+        let mut computer = Computer { vtbl: std::ptr::null(), refs: AtomicU32::new(1), tex };
+        let p = &mut computer as *mut Computer as *mut c_void;
+        let row_pitch = 144u32;
+        let slice_pitch = row_pitch * 32;
+        let mut original = vec![0xA5; slice_pitch as usize];
+        for y in 0..32usize {
+            for x in 0..128usize {
+                original[y * row_pitch as usize + x] = ((y * 17 + x) & 255) as u8;
+            }
+        }
+        let mut tiled = vec![0u8; computer.tex.size() as usize];
+        let mut roundtrip = vec![0xCC; original.len()];
+        unsafe {
+            assert_eq!(copy_into(p, tiled.as_mut_ptr(), 0, 0, original.as_ptr(), row_pitch, slice_pitch), S_OK);
+            assert_eq!(copy_from(p, roundtrip.as_mut_ptr(), 0, 0, 0x7_0000_0000, tiled.as_ptr(), row_pitch, slice_pitch), S_OK);
+        }
+        for y in 0..32usize {
+            let from = y * row_pitch as usize;
+            assert_eq!(&roundtrip[from..from + 128], &original[from..from + 128]);
+            assert!(roundtrip[from + 128..from + row_pitch as usize].iter().all(|&b| b == 0xCC));
+        }
+        unsafe {
+            assert_eq!(copy_from(p, roundtrip.as_mut_ptr(), 0, 0, 0x7_0000_0000, tiled.as_ptr(), 127, slice_pitch), E_INVALIDARG);
+        }
     }
 
     /// The console's R10G10B10_7E3_A2_FLOAT / _6E4_A2_FLOAT (116 / 117): 32 bits a pixel, laid
