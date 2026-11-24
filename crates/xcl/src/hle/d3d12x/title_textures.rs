@@ -823,10 +823,29 @@ unsafe fn refresh_once(queue: *mut c_void) {
     upload_all(todo);
 }
 
-/// staging bytes of one batch at most
+/// Default staging budget per upload batch. One list and GPU completion wait
+/// per batch; bigger batches reduce waits but increase transient upload-heap usage.
 const BATCH_BYTES: usize = 256 << 20;
 
-/// The uploads `todo`, in batches of up to `BATCH_BYTES` (one list and one wait each).
+/// XCL_TEXTURE_BATCH_MIB=16..512 permits a controlled batch-size experiment.
+/// Invalid values preserve the existing 256 MiB default.
+fn batch_size_from_env(raw: &str) -> Option<usize> {
+    raw.trim().parse::<usize>().ok().filter(|&mib| (16..=512).contains(&mib)).map(|mib| mib << 20)
+}
+
+fn texture_batch_bytes() -> usize {
+    static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BATCH.get_or_init(|| {
+        let bytes = std::env::var("XCL_TEXTURE_BATCH_MIB").ok()
+            .as_deref().and_then(batch_size_from_env).unwrap_or(BATCH_BYTES);
+        if perf_enabled() {
+            crate::xlog_info!("XCL PERF texture upload batch budget: {} MiB", bytes >> 20);
+        }
+        bytes
+    })
+}
+
+/// The uploads `todo`, in batches of up to `texture_batch_bytes()` (one list and one wait each).
 unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
@@ -834,13 +853,14 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             crate::xlog_warn!("title texture: upload failed: {e}");
         }
     };
+    let max_batch_bytes = texture_batch_bytes();
     let mut todo = todo.into_iter().peekable();
     while todo.peek().is_some() {
         let mut batch = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
         while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            if !batch.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
+            if !batch.is_empty() && (bytes.saturating_add(tex.size() as usize) > max_batch_bytes || *dev != device) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
@@ -1112,6 +1132,16 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configurable_upload_batch_preserves_default_and_bounds() {
+        assert_eq!(batch_size_from_env("256"), Some(256 << 20));
+        assert_eq!(batch_size_from_env("16"), Some(16 << 20));
+        assert_eq!(batch_size_from_env("512"), Some(512 << 20));
+        assert_eq!(batch_size_from_env("0"), None);
+        assert_eq!(batch_size_from_env("2048"), None);
+        assert_eq!(batch_size_from_env("not-a-number"), None);
+    }
 
     /// Real uploads, dirty-page detection and a source changing after registration:
     /// bookkeeping alone cannot show that the bytes the GPU sees follow the mirror.
