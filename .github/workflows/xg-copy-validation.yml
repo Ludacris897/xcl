@@ -1,0 +1,24 @@
+name: XG texture-copy regression (Windows)
+
+on:
+  push:
+    branches:
+      - experiment/xg-copy-validation-20261123
+  pull_request:
+    paths:
+      - 'crates/xcl/src/hle/xg.rs'
+      - 'crates/xcl/src/gpu/tiling.rs'
+      - '.github/workflows/xg-copy-validation.yml'
+  workflow_dispatch:
+
+jobs:
+  xg-copy:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify Windows compilation
+        run: cargo check -p xcl --lib --locked
+      - name: Run XG memory and texture-copy tests
+        run: cargo test -p xcl --lib xg::tests:: --locked -- --test-threads=1
