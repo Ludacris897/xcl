@@ -1,0 +1,27 @@
+name: BC1 BCPack experiment (Windows)
+
+on:
+  push:
+    branches:
+      - experiment/bcpack-bc1-optin-20261123
+  pull_request:
+    paths:
+      - 'crates/xcl/src/hle/dstorage.rs'
+      - 'crates/xcl/Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/bcpack-bc1-experiment.yml'
+  workflow_dispatch:
+
+jobs:
+  bc1:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Default build unchanged
+        run: cargo check -p xcl --lib --locked
+      - name: Experimental decoder build
+        run: cargo check -p xcl --lib --features bcpack-bc1 --locked
+      - name: Request shape regression
+        run: cargo test -p xcl --lib experimental_bc1_acceptance --features bcpack-bc1 --locked -- --test-threads=1
