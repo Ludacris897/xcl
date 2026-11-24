@@ -293,7 +293,13 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&up.list).map_err(err)?)]);
     up.value += 1;
     let copy_error = |e| format!("texture copy: {e}");
-    queue.Signal(&up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+    if let Err(e) = queue.Signal(&up.fence, up.value) {
+        // ExecuteCommandLists already ran; a failed signal does not establish
+        // completion. Apply the same conservative lifetime rule as a failed wait.
+        let error = copy_error(fence::api_error(dev, "Signal", e));
+        std::mem::forget(up);
+        return Err(error);
+    }
     if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
         // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
         // uploader next time) – freeing them under the GPU removed the device
