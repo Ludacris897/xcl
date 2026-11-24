@@ -210,6 +210,14 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
 /// the texture is in and is left in: one for every subresource, or one per subresource (D3D12
 /// order). A failure of one is returned with its index; the others still run.
 pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
+    if coalesced_uploads_enabled() {
+        return upload_batch_coalesced(dev, queue, items);
+    }
+    upload_batch_legacy(dev, queue, items)
+}
+
+/// Original per-texture upload-buffer path (also the fallback for oversized batches).
+unsafe fn upload_batch_legacy(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
     if items.is_empty() {
         return Ok(Vec::new());
     }
@@ -227,6 +235,150 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
     wait(dev, queue)?;
     drop(staging);
+    Ok(failed)
+}
+
+/// Coalesce small uploads behind an explicit runtime flag. Disabled by default until
+/// matched A/B runs establish a benefit and visual correctness.
+fn coalesced_uploads_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_COALESCE_UPLOADS").is_ok_and(|v| v == "1"))
+}
+
+/// D3D12 requires placed texture footprints to begin at 512-byte boundaries.
+fn placed_range(offset: u64, size: u64) -> Option<(u64, u64)> {
+    let start = offset.checked_add(511)? & !511;
+    let end = start.checked_add(size)?;
+    Some((start, end))
+}
+
+struct BatchLayout {
+    item: usize,
+    footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    rows: Vec<u32>,
+}
+
+/// Build one D3D12 upload-heap buffer for a complete batch, and wait *once* as
+/// before. The staged byte ranges and the GPU copy/barrier ordering are exactly
+/// the same as the per-resource path. A too-large batch or allocation failure
+/// falls back to the old implementation.
+unsafe fn upload_batch_coalesced(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)],
+) -> Result<Vec<(usize, String)>, String> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Cap staging independently of the texture pool's console-byte budget:
+    // D3D12 row pitch padding can substantially enlarge the actual upload.
+    const MAX_STAGE_BYTES: u64 = 512 << 20;
+    let mut total = 0u64;
+    let mut layouts = Vec::with_capacity(items.len());
+    let mut failed = Vec::new();
+    for (item, (resource, subs, states)) in items.iter().enumerate() {
+        let prepared = (|| -> Result<(Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>, Vec<u32>, u64), String> {
+            validate_subresources(subs)?;
+            let n = subs.len();
+            let rd = resource.GetDesc();
+            validate_subresource_count(&rd, n)?;
+            if states.len() != 1 && states.len() != n {
+                return Err(format!("{} subresource states for {n} subresources", states.len()));
+            }
+            let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
+            let mut rows = vec![0u32; n];
+            let mut row_bytes = vec![0u64; n];
+            let mut bytes = 0u64;
+            dev.GetCopyableFootprints(&rd, 0, n as u32, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_bytes.as_mut_ptr()), Some(&mut bytes));
+            for (i, ((sub, fp), (&nrows, &nbytes))) in subs.iter().zip(&fps).zip(rows.iter().zip(&row_bytes)).enumerate() {
+                if sub.rows != nrows as usize || sub.depth != fp.Footprint.Depth as usize || sub.row_bytes != nbytes as usize {
+                    return Err(format!(
+                        "texture subresource {i} is {}x{}x{} B, resource expects {}x{}x{} B",
+                        sub.row_bytes, sub.rows, sub.depth, nbytes, nrows, fp.Footprint.Depth
+                    ));
+                }
+            }
+            Ok((fps, rows, bytes))
+        })();
+        let (mut fps, rows, bytes) = match prepared {
+            Ok(v) => v,
+            Err(e) => { failed.push((item, e)); continue },
+        };
+        let Some((base, end)) = placed_range(total, bytes) else {
+            return upload_batch_legacy(dev, queue, items);
+        };
+        if end > MAX_STAGE_BYTES {
+            return upload_batch_legacy(dev, queue, items);
+        }
+        for fp in &mut fps {
+            let Some(at) = fp.Offset.checked_add(base) else {
+                return upload_batch_legacy(dev, queue, items);
+            };
+            fp.Offset = at;
+        }
+        total = end;
+        layouts.push(BatchLayout { item, footprints: fps, rows });
+    }
+    if layouts.is_empty() {
+        return Ok(failed);
+    }
+    let up = match buffer(dev, total) {
+        Ok(up) => up,
+        Err(_) => return upload_batch_legacy(dev, queue, items),
+    };
+    let mut p = std::ptr::null_mut();
+    up.Map(0, None, Some(&mut p)).map_err(err)?;
+    for layout in &layouts {
+        let subs = &items[layout.item].1;
+        for ((sub, fp), &nrows) in subs.iter().zip(&layout.footprints).zip(&layout.rows) {
+            let pitch = fp.Footprint.RowPitch as usize;
+            let row = sub.row_bytes.min(pitch);
+            let slice_pitch = pitch * nrows as usize;
+            for z in 0..(fp.Footprint.Depth as usize).min(sub.depth) {
+                for y in 0..(nrows as usize).min(sub.rows) {
+                    let at = fp.Offset as usize + z * slice_pitch + y * pitch;
+                    std::ptr::copy_nonoverlapping(
+                        sub.data[(z * sub.rows + y) * sub.row_bytes..].as_ptr(),
+                        (p as *mut u8).add(at),
+                        row,
+                    );
+                }
+            }
+        }
+    }
+    up.Unmap(0, None);
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
+    for layout in &layouts {
+        let (resource, subs, states) = &items[layout.item];
+        let n = subs.len();
+        let to_copy = transitions(resource, states, &[D3D12_RESOURCE_STATE_COPY_DEST], n);
+        if !to_copy.is_empty() {
+            list.ResourceBarrier(&to_copy);
+        }
+        for (subresource, fp) in layout.footprints.iter().enumerate() {
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(resource),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: subresource as u32 },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&up),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp },
+            };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        let back = transitions(resource, &[D3D12_RESOURCE_STATE_COPY_DEST], states, n);
+        if !back.is_empty() {
+            list.ResourceBarrier(&back);
+        }
+    }
+    list.Close().map_err(err)?;
+    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
+    let result = wait(dev, queue);
+    drop(up);
+    result?;
     Ok(failed)
 }
 
@@ -434,6 +586,18 @@ fn transition_sub(r: &ID3D12Resource, sub: u32, before: D3D12_RESOURCE_STATES, a
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn coalesced_footprint_offsets_are_aligned_and_overflow_safe() {
+        assert_eq!(placed_range(0, 256), Some((0, 256)));
+        assert_eq!(placed_range(256, 128), Some((512, 640)));
+        assert_eq!(placed_range(512, 256), Some((512, 768)));
+        assert_eq!(placed_range(u64::MAX, 1), None);
+        assert_eq!(placed_range(u64::MAX - 511, 1024), None);
+        let (a, end_a) = placed_range(0, 16384).unwrap();
+        let (b, end_b) = placed_range(end_a, 4096).unwrap();
+        assert_eq!((a, b, end_b), (0, 16384, 20480));
+    }
+
     use super::*;
     use std::collections::HashMap;
     use windows::Win32::Graphics::Dxgi::Common::*;
