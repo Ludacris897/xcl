@@ -287,7 +287,7 @@ unsafe fn upload_batch_coalesced(
     }
     let fallback = || {
         COALESCED_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-        upload_batch_legacy(dev, queue, items)
+        unsafe { upload_batch_legacy(dev, queue, items) }
     };
     // Cap staging independently of the texture pool's console-byte budget:
     // D3D12 row pitch padding can substantially enlarge the actual upload.
