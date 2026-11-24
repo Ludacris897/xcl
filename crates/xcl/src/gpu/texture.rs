@@ -15,7 +15,9 @@ use super::fence;
 use super::tiling::{self, Chain, PipeConfig};
 use std::cell::RefCell;
 use windows::core::Interface;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::System::Threading::CreateEventW;
 
 /// Pipes / packers of the console's GB_ADDR_CONFIG – only the XOR (_X) modes depend on it.
 /// From the console's own layout library: every texel of every mode matches with 32 pipes /
@@ -321,6 +323,13 @@ struct UploadWait {
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     value: u64,
+    event: HANDLE,
+}
+
+impl Drop for UploadWait {
+    fn drop(&mut self) {
+        unsafe { let _ = CloseHandle(self.event); }
+    }
 }
 
 /// Bounded per-thread cache: XCL's texture refresh is serialized, but diagnostic
@@ -339,7 +348,7 @@ thread_local! {
 /// GPU waits or change staging-resource lifetimes.
 pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(), String> {
     let copy_error = |e| format!("texture copy: {e}");
-    let (fence, value) = WAIT_CACHE.with(|cache| {
+    let (fence, value, event) = WAIT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(entry) = cache.iter_mut().find(|e|
             e.queue.as_raw() == queue.as_raw() && e.device.as_raw() == dev.as_raw()
@@ -348,16 +357,18 @@ pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(),
             // signal cannot satisfy a future wait accidentally.
             if let Some(next) = entry.value.checked_add(1) {
                 entry.value = next;
-                return Ok((entry.fence.clone(), next));
+                return Ok((entry.fence.clone(), next, entry.event));
             }
             let fresh = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
                 .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
             entry.fence = fresh.clone();
             entry.value = 1;
-            return Ok((fresh, 1));
+            return Ok((fresh, 1, entry.event));
         }
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
             .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
+        let event = CreateEventW(None, false, false, None)
+            .map_err(|e| copy_error(fence::api_error(dev, "CreateEventW", e)))?;
         if cache.len() == 4 {
             cache.remove(0);
         }
@@ -366,11 +377,12 @@ pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(),
             queue: queue.clone(),
             fence: fence.clone(),
             value: 1,
+            event,
         });
-        Ok((fence, 1))
+        Ok((fence, 1, event))
     })?;
     queue.Signal(&fence, value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
-    fence::wait(&fence, value, dev, None, 10_000).map_err(copy_error)
+    fence::wait(&fence, value, dev, Some(event), 10_000).map_err(copy_error)
 }
 
 unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String> {
